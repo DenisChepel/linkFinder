@@ -28,7 +28,7 @@ import core
 
 # Shown in the interface header. If it does not change after a code update,
 # the server is still running the old code and needs a restart.
-VERSION = "2.9"
+VERSION = "3.0"
 
 HOST = "127.0.0.1"
 PORT = 8765

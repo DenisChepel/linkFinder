@@ -30,8 +30,9 @@
   const state = {
     logIndex: 0,     // how many log lines are already rendered
     pollTimer: null,
-    results: null,   // { hits, broken, pages }
-    activeTab: null
+    results: null,   // { hits, broken, pages, orphans }
+    activeTab: null,
+    sort: {}         // per tab: { index, dir } of the column being sorted
   };
 
   /* ------------------------------------------------------------------------
@@ -108,6 +109,7 @@
     state.logIndex = 0;
     state.results = null;
     state.activeTab = null;
+    state.sort = {};
 
     $('log').textContent = '';
     $('progressCard').hidden = false;
@@ -422,44 +424,113 @@
     </tr>`;
   }
 
+  /* Only the columns worth ranking are clickable — status, indexability and
+     counts. Sorting URLs or titles alphabetically helps nobody.
+     `first: 'desc'` starts from the high end, so the first click on a count
+     shows the biggest values rather than the smallest. */
   const TABLE_SPECS = {
     hits: {
-      head: ['Page holding the link', 'Found link', 'Where exactly', 'Link or button text'],
+      columns: [
+        { label: 'Page holding the link' },
+        { label: 'Found link' },
+        // 0 = technical placement, so the first click lifts problems up
+        { label: 'Where exactly', by: h => (h.visible ? 1 : 0) },
+        { label: 'Link or button text' }
+      ],
       source: () => state.results.hits,
       row: hitRow
     },
     broken: {
-      head: ['Page holding the link', 'Broken link', 'Reason', 'Where exactly', 'Link text'],
+      columns: [
+        { label: 'Page holding the link' },
+        { label: 'Broken link' },
+        { label: 'Reason', by: b => (typeof b.status === 'number' ? b.status : 999), first: 'desc' },
+        { label: 'Where exactly', by: b => (b.visible ? 1 : 0) },
+        { label: 'Link text' }
+      ],
       source: () => state.results.broken,
       row: brokenRow
     },
     orphans: {
-      head: ['Page nothing links to', 'Title', 'Links out', 'Source'],
+      columns: [
+        { label: 'Page nothing links to' },
+        { label: 'Title' },
+        { label: 'Links out', by: o => o.links_out, first: 'desc' },
+        { label: 'Source', by: o => (o.in_sitemap ? 1 : 0) }
+      ],
       source: () => state.results.orphans,
       row: orphanRow
     },
     pages: {
-      head: ['Page URL', 'Status', 'Indexable', 'Title', 'Links'],
+      columns: [
+        { label: 'Page URL' },
+        { label: 'Status', by: p => (typeof p.status === 'number' ? p.status : 999), first: 'desc' },
+        // 0 = cannot be indexed, so the first click lifts the problems up
+        { label: 'Indexable', by: p => (p.indexable ? 1 : 0) },
+        { label: 'Title' },
+        { label: 'Links', by: p => p.links, first: 'desc' }
+      ],
       source: () => state.results.pages,
       row: pageRow
     }
   };
 
+  function sortRows(rows, spec) {
+    const order = state.sort[state.activeTab];
+    if (!order) return rows;
+
+    const by = spec.columns[order.index].by;
+    const sign = order.dir === 'asc' ? 1 : -1;
+
+    return [...rows].sort((a, b) => {
+      const va = by(a), vb = by(b);
+      if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * sign;
+      return String(va).localeCompare(String(vb), undefined, { numeric: true }) * sign;
+    });
+  }
+
+  function toggleSort(index) {
+    const spec = TABLE_SPECS[state.activeTab];
+    const current = state.sort[state.activeTab];
+
+    if (current && current.index === index) {
+      current.dir = current.dir === 'asc' ? 'desc' : 'asc';
+    } else {
+      state.sort[state.activeTab] = {
+        index,
+        dir: spec.columns[index].first === 'desc' ? 'desc' : 'asc'
+      };
+    }
+    renderTable();
+  }
+
   function renderTable() {
     if (!state.results || !state.activeTab) return;
 
     const spec = TABLE_SPECS[state.activeTab];
+    const order = state.sort[state.activeTab];
     const query = $('filter').value.trim().toLowerCase();
 
     const matches = (row) => !query ||
       Object.values(row).some((v) => String(v ?? '').toLowerCase().includes(query));
 
-    const rows = spec.source().filter(matches).map(spec.row);
+    const data = sortRows(spec.source().filter(matches), spec);
+    const rows = data.map(spec.row);
+
+    const head = spec.columns.map((col, i) => {
+      if (!col.by) return `<th>${col.label}</th>`;
+      const active = order && order.index === i;
+      const arrow = active ? (order.dir === 'asc' ? '▲' : '▼') : '⇅';
+      return `<th class="th-sort ${active ? 'is-sorted' : ''}" data-col="${i}"
+                  title="Sort by ${col.label}">
+                ${col.label}<span class="th-sort__arrow">${arrow}</span>
+              </th>`;
+    }).join('');
 
     $('tableBox').innerHTML = rows.length
       ? `<div class="table-wrap">
            <table>
-             <thead><tr>${spec.head.map((h) => `<th>${h}</th>`).join('')}</tr></thead>
+             <thead><tr>${head}</tr></thead>
              <tbody>${rows.join('')}</tbody>
            </table>
          </div>`
@@ -510,6 +581,12 @@
   $('downloadBtn').addEventListener('click', download);
   $('folderBtn').addEventListener('click', () => fetch('/api/open-folder'));
   $('filter').addEventListener('input', renderTable);
+
+  // the table is re-rendered wholesale, so the header listens through the container
+  $('tableBox').addEventListener('click', (e) => {
+    const th = e.target.closest('.th-sort');
+    if (th) toggleSort(Number(th.dataset.col));
+  });
 
   applyMode();
 

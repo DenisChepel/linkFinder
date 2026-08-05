@@ -210,8 +210,9 @@ at other sites, tick **"Check external links"** in the advanced settings (slower
 
 ## Results
 
-- **In the browser** — filterable tables: the "Filter the table" box instantly narrows
-  rows by any piece of text. Every address is clickable.
+- **In the browser** — filterable, sortable tables. The "Filter the table" box instantly
+  narrows rows by any piece of text, and clicking **Status**, **Indexable** or **Links**
+  sorts by that column — the first click puts the problems on top. Every address is clickable.
 - **Excel** — the "⬇ Download Excel" button. The file is built **only when you click
   the button**; nothing is saved on its own after a scan. Downloaded reports land in
   the `results/` folder ("📁 Results folder" opens it).

@@ -440,6 +440,25 @@ th {
   white-space: nowrap;
 }
 
+/* sortable column headers */
+.th-sort {
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s;
+}
+
+.th-sort:hover                    { color: var(--text); }
+.th-sort:hover .th-sort__arrow    { opacity: 0.9; }
+.th-sort.is-sorted                { color: var(--accent); }
+
+.th-sort__arrow {
+  margin-left: 6px;
+  font-size: 10px;
+  opacity: 0.4;
+}
+
+.th-sort.is-sorted .th-sort__arrow { opacity: 1; }
+
 td {
   padding: 8px 12px;
   border-bottom: 1px solid var(--line-soft);
