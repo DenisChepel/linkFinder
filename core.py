@@ -299,6 +299,13 @@ LINK_REL_LABELS = {
 }
 
 
+MATCH_KINDS = {
+    "direct": "links here",
+    "mention": "only mentions the address inside another link",
+    "self": "the page referring to itself",
+}
+
+
 def points_at_page(tag: str, rel: str = "") -> bool:
     """
     Does this link point at a page (rather than at a loaded resource)?
@@ -340,6 +347,18 @@ class LinkHit:
     status: object = None  # status of the found link itself (filled during search)
     no_internal: bool = False  # nothing but technical tags points at this address
 
+    # How the match relates to the address we searched for:
+    #   direct  - the link actually points there
+    #   mention - the address only appears inside another link, e.g. a share
+    #             button: facebook.com/share.php?u=<our address>
+    #   self    - the page links to itself (canonical, hreflang, share button)
+    kind: str = "direct"
+
+    # Whether the page holding the link is canonical. Links from a page whose
+    # canonical points elsewhere (typically pagination) carry no weight for
+    # search engines, and crawlers like Sitebulb leave them out of the count.
+    source_canonical: bool = True
+
     @property
     def where(self) -> str:
         return describe_source(self.tag, self.rel)[0]
@@ -358,6 +377,7 @@ class PageInfo:
     content_type: str = ""
     links_count: int = 0
     error: str = ""
+    canonical: str = ""   # rel=canonical, if the page declares one
 
 
 @dataclass
@@ -414,6 +434,8 @@ class SiteAuditor:
         self.status_cache: dict[str, object] = {}
         self.sitemap_count = 0
         self.sitemap_keys: set[str] = set()
+        self.inbound_pages = 0            # pages that really link to the query
+        self.inbound_pages_canonical = 0  # ... of which are canonical
         self.started_at = None
         self.finished_at = None
 
@@ -650,6 +672,11 @@ class SiteAuditor:
             links, title = self.extract_links(url, text) if text else ([], "")
             info.title = title
             info.links_count = len(links)
+            info.canonical = next(
+                (l.absolute for l in links
+                 if l.tag == "link" and "canonical" in (l.rel or "")),
+                "",
+            )
             if self.opts.search_raw_html and text and self.opts.query:
                 known = {url_key(l.absolute) for l in links}
                 links.extend(self.scan_raw_html(url, text, known))
@@ -774,6 +801,32 @@ class SiteAuditor:
                 break
         return hits
 
+    def classify_hits(self, needle: str) -> None:
+        """
+        Sorts matches into real links, mere mentions and self-references, and
+        marks which source pages are canonical.
+
+        A share button reads facebook.com/share.php?u=<our address>: the address
+        is in the query string of a link that goes to Facebook. It matches the
+        search, but it is not a link to us - counting it as one is how inflated
+        "internal links" numbers happen.
+        """
+        for h in self.search_hits:
+            target = urlparse(h.absolute)
+            in_address = needle in (target.netloc + target.path).lower()
+            in_query = bool(target.query) and needle in target.query.lower()
+
+            if in_query and not in_address:
+                h.kind = "mention"
+            elif url_key(h.page) == url_key(h.absolute):
+                h.kind = "self"
+            else:
+                h.kind = "direct"
+
+            src = self.pages.get(h.page)
+            if src and src.canonical:
+                h.source_canonical = url_key(src.canonical) == url_key(h.page)
+
     def run_search(self) -> None:
         q = self.opts.query
         if not q:
@@ -817,15 +870,51 @@ class SiteAuditor:
         if not self.search_hits:
             return
 
+        self.classify_hits(needle)
+
         # Per address: is it referenced by any normal link at all? If every
         # match sits in a technical tag, nothing on the site actually links
         # there - the SEO tools call this "no internal linking URLs".
+        # Only a real link from another page counts. A share button that carries
+        # the address in its query string does not, nor does the page itself.
         visible_per_target: dict[str, int] = {}
         for h in self.search_hits:
             key = url_key(h.absolute)
-            visible_per_target[key] = visible_per_target.get(key, 0) + (1 if h.visible else 0)
+            counts = h.visible and h.kind == "direct"
+            visible_per_target[key] = visible_per_target.get(key, 0) + (1 if counts else 0)
         for h in self.search_hits:
+            # the flag is about OUR pages: a share button points at facebook.com,
+            # and whether anything links to Facebook is none of our business
+            if h.kind == "mention" or not self.in_scope(h.absolute):
+                h.no_internal = False
+                continue
             h.no_internal = visible_per_target.get(url_key(h.absolute), 0) == 0
+
+        # Inbound counts, reported the way established crawlers do it: pages
+        # that genuinely link here, and how many of those actually pass weight.
+        direct = [h for h in self.search_hits if h.kind == "direct"]
+        self.inbound_pages = len({url_key(h.page) for h in direct})
+        self.inbound_pages_canonical = len(
+            {url_key(h.page) for h in direct if h.source_canonical}
+        )
+        mentions = sum(1 for h in self.search_hits if h.kind == "mention")
+        selfies = sum(1 for h in self.search_hits if h.kind == "self")
+
+        self.log(f"  {self.inbound_pages} {pl(self.inbound_pages, 'page')} link here "
+                 f"({self.inbound_pages_canonical} of them canonical - the number an "
+                 f"SEO crawler reports)")
+        if mentions:
+            self.log(f"  {mentions} {pl(mentions, 'match', 'matches')} only mention the "
+                     f"address inside another link (share buttons, redirects) - "
+                     f"not a link to it")
+        if selfies:
+            self.log(f"  {selfies} {pl(selfies, 'match', 'matches')} "
+                     f"{pl(selfies, 'is', 'are')} the page referring to itself")
+        non_canon = self.inbound_pages - self.inbound_pages_canonical
+        if non_canon:
+            self.log(f"  {non_canon} source {pl(non_canon, 'page')} "
+                     f"{pl(non_canon, 'is', 'are')} non-canonical (usually pagination) - "
+                     f"search engines discount {pl(non_canon, 'it', 'them')}")
 
         orphaned = {url_key(h.absolute) for h in self.search_hits if h.no_internal}
         if orphaned:
@@ -1055,6 +1144,9 @@ class SiteAuditor:
             "links": len([l for l in self.all_links if l.tag != RAW_TAG]),
             "hits": len(self.search_hits),
             "hit_pages": len({h.page for h in self.search_hits}),
+            "inbound_pages": self.inbound_pages,
+            "inbound_pages_canonical": self.inbound_pages_canonical,
+            "mentions": sum(1 for h in self.search_hits if h.kind == "mention"),
             "broken": len(self.broken),
             "broken_unique": len({b["link"] for b in self.broken}),
             "orphans": len(self.orphans),
@@ -1110,6 +1202,9 @@ def export_xlsx(auditor: SiteAuditor, path: str) -> str:
             ("Links collected", s["links"]),
             ("Matches found", s["hits"]),
             ("Pages with matches", s["hit_pages"]),
+            ("Pages that link here", s["inbound_pages"]),
+            ("... of them canonical (SEO count)", s["inbound_pages_canonical"]),
+            ("Mentions inside other links (not links here)", s["mentions"]),
             ("Broken links (occurrences)", s["broken"]),
             ("Broken links (unique)", s["broken_unique"]),
             ("Pages with no internal links", s["orphans"] if s["orphans_checked"] else "not checked"),
@@ -1123,16 +1218,18 @@ def export_xlsx(auditor: SiteAuditor, path: str) -> str:
     if auditor.search_hits:
         make_sheet(
             "Where the link was found",
-            ["Page holding the link", "Full link", "Where exactly",
-             "On the page / technical", "Link status", "Link or button text",
-             "href as written", "Source context"],
+            ["Page holding the link", "Full link", "Match type", "Source page",
+             "Where exactly", "On the page / technical", "Link status",
+             "Link or button text", "href as written", "Source context"],
             [
-                (h.page, h.absolute, h.where, "on the page" if h.visible else "technical",
+                (h.page, h.absolute, MATCH_KINDS[h.kind],
+                 "canonical" if h.source_canonical else "non-canonical (discounted)",
+                 h.where, "on the page" if h.visible else "technical",
                  describe_status(h.status) if h.status is not None else "not checked",
                  h.text, h.href, h.context)
                 for h in auditor.search_hits
             ],
-            [55, 55, 46, 22, 40, 28, 45, 60],
+            [52, 52, 34, 26, 44, 22, 38, 26, 42, 55],
         )
 
     if auditor.broken:

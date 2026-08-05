@@ -215,6 +215,18 @@
         `matches on ${summary.hit_pages ?? 0} pages`,
         summary.hits ? 'stat--good' : 'stat--warn'
       ));
+      tiles.push(statTile(
+        summary.inbound_pages ?? 0,
+        `pages link here (${summary.inbound_pages_canonical ?? 0} canonical)`,
+        summary.inbound_pages ? 'stat--good' : 'stat--warn'
+      ));
+      if (summary.mentions) {
+        tiles.push(statTile(
+          summary.mentions,
+          'mentions inside other links',
+          'stat--warn'
+        ));
+      }
     }
 
     if (summary.mode === 'broken' || summary.mode === 'full') {
@@ -298,9 +310,29 @@
       ? `<div class="cell-note"><code>${escapeHtml(hit.context.slice(0, 160))}</code></div>`
       : '';
 
+    // links here / only mentions the address / the page itself
+    const kindPill = {
+      direct:  '<span class="pill pill--good">links here</span>',
+      mention: '<span class="pill pill--warn">not a link here</span>',
+      self:    '<span class="pill pill--info">links to itself</span>'
+    }[hit.kind] || '';
+
+    const kindNote = hit.kind === 'direct' ? '' :
+      `<div class="cell-note">${escapeHtml(hit.kind_text)}</div>`;
+
+    const sourceNote = hit.source_canonical ? '' :
+      `<div class="cell-note">
+         <span class="pill pill--warn">non-canonical source</span>
+         <span class="cell-note"> pagination or a duplicate — search engines discount it</span>
+       </div>`;
+
     return `<tr>
-      <td>${linkTo(hit.page)}</td>
-      <td>${linkTo(hit.absolute)}${statusPill}${noInternal}${rawHref}</td>
+      <td>${linkTo(hit.page)}${sourceNote}</td>
+      <td>
+        ${linkTo(hit.absolute)}
+        <div class="cell-note">${kindPill}</div>
+        ${kindNote}${statusPill}${noInternal}${rawHref}
+      </td>
       <td>
         <span class="pill ${hit.visible ? 'pill--good' : 'pill--warn'}">
           ${hit.visible ? '👁 On the page' : '🔧 Technical'}

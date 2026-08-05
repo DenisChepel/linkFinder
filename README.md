@@ -122,6 +122,32 @@ Technical matches are things like:
 If a match is tagged **🔧 Technical**, looking for it on the page itself is pointless —
 open the page source instead (`Ctrl+U` in the browser).
 
+#### Match type — not every match is a link
+
+A search for a URL also matches links that merely *carry* that URL, most often
+share buttons:
+
+```
+http://www.facebook.com/share.php?u=https://example.com/blog/post
+```
+
+That link goes to Facebook; your address just rides along in its query string.
+Counting it as an inbound link is how inflated numbers happen, so every match is
+labelled:
+
+- **links here** — a real link to the address;
+- **not a link here** — the address only appears inside another link;
+- **links to itself** — the page's own canonical, hreflang or share button.
+
+The summary shows **how many pages link here**, and separately **how many of those
+are canonical**. The second number is what SEO crawlers report: a link from
+`/blog/page/18` whose canonical points at `/blog` is discounted, because the site
+itself declares that page a duplicate. Such sources are marked
+**non-canonical source** in the table.
+
+On a real page this gave *7 pages link here, 5 of them canonical* — and Sitebulb
+reported exactly 5 for the same URL.
+
 #### Status of the found link
 
 Under each address you see whether it works: **✓ works** or **✕ 404**.
