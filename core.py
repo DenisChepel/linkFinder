@@ -1089,7 +1089,8 @@ class SiteAuditor:
 
         if "html" not in (page.content_type or "").lower():
             page.indexable, page.index_status = True, "Not a page"
-            page.index_reason = f"served as {page.content_type or 'unknown type'}"
+            page.index_reason = (f"a file rather than a page — served as "
+                                 f"{page.content_type or 'an unknown type'}")
             return
 
         try:
@@ -1098,20 +1099,50 @@ class SiteAuditor:
             allowed = True
         if not allowed:
             page.indexable, page.index_status = False, "Blocked by robots.txt"
-            page.index_reason = "robots.txt disallows this path"
+            page.index_reason = ("robots.txt forbids crawlers from opening this "
+                                 "address, so it never reaches the index")
             return
 
-        directives = f"{page.x_robots} {page.meta_robots}".lower()
-        if "noindex" in directives or re.search(r"\bnone\b", directives):
-            source = "X-Robots-Tag header" if "noindex" in (page.x_robots or "").lower() \
-                else "meta robots tag"
+        # "noindex" and the shorthand "none" both keep a page out of the index.
+        # Name the tag that actually carries it - sending someone to hunt for a
+        # meta tag when the directive came in a header wastes their time.
+        def blocks_indexing(value: str) -> bool:
+            value = (value or "").lower()
+            return "noindex" in value or bool(re.search(r"\bnone\b", value))
+
+        if blocks_indexing(page.x_robots) or blocks_indexing(page.meta_robots):
+            if blocks_indexing(page.x_robots):
+                # a header is invisible in the page source, so say where to look
+                source = "sent by the server as an HTTP header X-Robots-Tag"
+                value = (page.x_robots or "").strip()
+            else:
+                source = 'in the page code: <meta name="robots">'
+                value = (page.meta_robots or "").strip()
+
+            # "none" is shorthand for "noindex, nofollow" and reads like the
+            # exact opposite to anyone who has not met it before
+            shorthand = (" — \"none\" is shorthand for \"noindex, nofollow\""
+                         if re.search(r"\bnone\b", value.lower())
+                         and "noindex" not in value.lower() else "")
+
             page.indexable, page.index_status = False, "Noindex"
-            page.index_reason = f"{source} says: {(page.x_robots or page.meta_robots).strip()}"
+            page.index_reason = (
+                f"the page asks search engines to skip it: {value}{shorthand} "
+                f"({source})"
+            )
+            if "hs_preview=" in page.url.lower():
+                page.index_reason += (
+                    " — this is a preview link of an unpublished draft, "
+                    "those are never indexed"
+                )
             return
 
         if page.canonical and url_key(page.canonical) != url_key(page.url):
             page.indexable, page.index_status = False, "Canonicalised"
-            page.index_reason = f"canonical points to {page.canonical}"
+            page.index_reason = (
+                f"the page declares another address as the original, so search "
+                f"engines index that one instead: {page.canonical}"
+            )
             return
 
         page.indexable, page.index_status, page.index_reason = True, "Indexable", ""
