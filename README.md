@@ -29,8 +29,11 @@ The libraries (`requests`, `beautifulsoup4`, `openpyxl`) are installed once and 
 > **Restart the program after a code update.** Python reads `.py` files once, at
 > startup. Until the black window is closed and opened again, the old version keeps
 > running even though the files on disk are new. Easy to verify: the **version is shown
-> on the right of the interface header** (currently `2.2`) and in the console at startup.
-> If it changed, the code is fresh.
+> on the right of the interface header** and in the console at startup. If it changed,
+> the code is fresh.
+>
+> Starting a second copy while the first is running is safe: it takes the next free
+> port and says so in the console. Check the address bar if you have two windows open.
 
 ---
 

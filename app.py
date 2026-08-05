@@ -28,7 +28,7 @@ import core
 
 # Shown in the interface header. If it does not change after a code update,
 # the server is still running the old code and needs a restart.
-VERSION = "2.7"
+VERSION = "2.8"
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -358,6 +358,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_text("Not found", 404)
 
 
+class Server(ThreadingHTTPServer):
+    """
+    HTTPServer enables SO_REUSEADDR by default. On Windows that lets a second
+    process bind a port another process is already listening on: the new copy
+    looks like it started fine, but every request still reaches the first one -
+    so an updated build appears to run while serving the old code. Turning the
+    option off makes binding fail honestly, so the port search below works.
+    """
+    allow_reuse_address = False
+    daemon_threads = True
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -368,7 +380,7 @@ def main():
     server, port = None, PORT
     for candidate in range(PORT, PORT + 20):
         try:
-            server = ThreadingHTTPServer((HOST, candidate), Handler)
+            server = Server((HOST, candidate), Handler)
             port = candidate
             break
         except OSError:
@@ -376,6 +388,9 @@ def main():
     if server is None:
         print(f"Could not bind any port in range {PORT}-{PORT + 19}.")
         return
+
+    if port != PORT:
+        print(f"  NOTE: port {PORT} is taken by another copy - using {port} instead")
 
     url = f"http://{HOST}:{port}"
     print("=" * 60)
