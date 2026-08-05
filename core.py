@@ -1,0 +1,1063 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+core.py - crawling engine and link audit.
+
+What it does:
+  * collects EVERY page of a domain: sitemap.xml + robots.txt + live link crawl
+    (not either/or, but both - that is how pages missing from the sitemap show up);
+  * pulls links from <a> as well as <img>, <script>, <link>, <iframe>, <form>, ...
+    (on many sites the buttons are not <a> tags at all);
+  * searches for a given link/substring/regex across all pages, including raw HTML
+    (catches links buried inside JS and JSON configs);
+  * checks links for breakage and explains the REASON in plain language;
+  * writes the result to .xlsx.
+
+Used by app.py (web interface) and cli.py (command line).
+"""
+
+from __future__ import annotations
+
+import html
+import re
+import threading
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Callable, Iterable
+from urllib.parse import urljoin, urlparse, urldefrag, urlunparse, parse_qsl, urlencode
+import xml.etree.ElementTree as ET
+
+import requests
+from bs4 import BeautifulSoup
+
+# ----------------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------------
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 SiteLinkFinder/1.0"
+)
+TIMEOUT = 20
+MAX_BODY_BYTES = 8 * 1024 * 1024  # never pull huge files into memory
+
+# Where links come from: tag -> attribute
+LINK_SOURCES = {
+    "a": "href",
+    "area": "href",
+    "link": "href",
+    "img": "src",
+    "script": "src",
+    "iframe": "src",
+    "frame": "src",
+    "embed": "src",
+    "source": "src",
+    "video": "src",
+    "audio": "src",
+    "track": "src",
+    "object": "data",
+    "form": "action",
+}
+
+# What counts as a "real" link rather than a loaded resource
+NAVIGATION_TAGS = {"a", "area", "form"}
+
+# <link> rel values worth collecting at all
+ALLOWED_LINK_RELS = {
+    "stylesheet", "canonical", "alternate", "icon", "preload", "prefetch",
+    "next", "prev", "amphtml", "shortlink",
+}
+
+# <link> rel values that point at PAGES rather than at resources. A broken
+# hreflang or canonical is a real defect - search engines follow those tags -
+# so they are checked alongside ordinary <a> links, not with images and css.
+PAGE_LEVEL_RELS = {"canonical", "alternate", "next", "prev", "amphtml", "shortlink"}
+
+# Pseudo-tag for links found in raw HTML (scripts, JSON, data attributes)
+RAW_TAG = "page source"
+
+SKIP_SCHEMES = ("mailto:", "tel:", "javascript:", "data:", "sms:", "callto:", "#")
+
+# Extensions that should not be crawled as HTML pages
+NON_PAGE_EXT = re.compile(
+    r"\.(jpg|jpeg|png|gif|svg|webp|ico|bmp|avif|css|js|mjs|json|xml|txt|pdf|zip|rar|7z|"
+    r"gz|tar|mp4|webm|mp3|wav|avi|mov|woff2?|ttf|eot|otf|doc|docx|xls|xlsx|ppt|pptx|csv)$",
+    re.I,
+)
+
+# Links hidden in raw HTML / JS.
+# Absolute: https://...  Relative: "/path" inside quotes.
+RAW_URL_RE = re.compile(r"""https?://[^\s"'<>\\)\]]+""", re.I)
+RAW_REL_RE = re.compile(r"""["'(](/[A-Za-z0-9\-._~!$&*+,;=:@%/?#\[\]]{2,300})["')]""")
+
+STATUS_REASONS = {
+    400: "Bad request (400)",
+    401: "Authorization required (401)",
+    403: "Forbidden (403) - often bot protection, check manually",
+    404: "Page not found (404) - broken link",
+    405: "Method not allowed (405)",
+    408: "Request timeout (408)",
+    410: "Page permanently removed (410)",
+    429: "Too many requests (429) - lower the thread count",
+    451: "Blocked for legal reasons (451)",
+    500: "Internal server error (500)",
+    502: "Bad gateway (502)",
+    503: "Service unavailable (503)",
+    504: "Gateway timeout (504)",
+    # LinkedIn answers any bot with 999; the link itself is almost always fine
+    999: "Bot protection (999) - LinkedIn blocks crawlers, the link is likely fine",
+}
+
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+
+def normalize_domain(domain: str) -> str:
+    """'example.com' -> 'https://example.com'"""
+    domain = (domain or "").strip()
+    if not domain:
+        return ""
+    if not domain.startswith(("http://", "https://")):
+        domain = "https://" + domain
+    return domain.rstrip("/")
+
+
+def registrable(netloc: str) -> str:
+    """Rough 'example.com' out of 'www.blog.example.com' - used for subdomain checks."""
+    host = netloc.lower().split(":")[0]
+    parts = host.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def clean_url(url: str) -> str:
+    """Strips the fragment and stray whitespace/newlines out of an href."""
+    url = html.unescape((url or "").strip())
+    url = re.sub(r"\s+", "", url)
+    url, _ = urldefrag(url)
+    return url
+
+
+# Advertising and analytics tags: they do not change page content but spawn
+# "new" addresses during a crawl (?_ga=..., ?utm_source=... and friends)
+# NB: only unambiguous tracking keys belong here. A generic name like "ref" is
+# skipped on purpose - on some sites (?ref=main) it selects real content, and
+# collapsing it would merge pages that are genuinely different.
+TRACKING_PARAMS = {
+    "_ga", "_gl", "_hsenc", "_hsmi", "hsctatracking", "gclid", "dclid", "fbclid",
+    "msclkid", "yclid", "igshid", "mc_cid", "mc_eid", "referrer",
+    "vero_id", "vero_conv", "s_kwcid", "twclid", "ttclid", "li_fat_id",
+}
+
+
+def strip_tracking(url: str) -> str:
+    """Removes tracking tags from an address, keeping meaningful parameters."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return url
+    if not p.query:
+        return url
+    kept = [
+        (k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+        if k.lower() not in TRACKING_PARAMS and not k.lower().startswith("utm_")
+    ]
+    return urlunparse(p._replace(query=urlencode(kept)))
+
+
+def url_key(url: str) -> str:
+    """
+    Normalized key for comparing links: scheme, www, trailing slash, host case
+    and tracking tags are all ignored.
+    """
+    try:
+        p = urlparse(strip_tracking(url))
+    except Exception:
+        return (url or "").lower()
+    host = p.netloc.lower().split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    path = p.path or "/"
+    if len(path) > 1:
+        path = path.rstrip("/")
+    # sort parameters: ?a=1&b=2 and ?b=2&a=1 are the same address
+    pairs = sorted(parse_qsl(p.query, keep_blank_values=True))
+    q = f"?{urlencode(pairs)}" if pairs else ""
+    return f"{host}{path}{q}".lower()
+
+
+HOSTLIKE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9-]+)+(?:[:/?#]|$)", re.I)
+
+
+def query_to_url(query: str, root: str) -> str:
+    """
+    Turns whatever the user typed into an absolute URL.
+
+    'https://site.com/page'  -> unchanged
+    '/page'                  -> https://site.com/page
+    'site.com/page'          -> https://site.com/page   (not site.com/site.com/page)
+    'page'                   -> https://site.com/page
+    """
+    q = clean_url(query)
+    if not q:
+        return ""
+    if q.lower().startswith(("http://", "https://")):
+        return q
+    if q.startswith("//"):
+        return "https:" + q
+    if HOSTLIKE_RE.match(q):
+        return "https://" + q
+    return urljoin(root.rstrip("/") + "/", q.lstrip("/"))
+
+
+def pl(n: int, word: str, plural_form: str | None = None) -> str:
+    """1 page / 2 pages"""
+    return word if abs(n) == 1 else (plural_form or word + "s")
+
+
+def is_page_like(url: str) -> bool:
+    """Does this look like an HTML page (rather than an image or archive)?"""
+    path = urlparse(url).path
+    return not NON_PAGE_EXT.search(path)
+
+
+def describe_status(status) -> str:
+    """Human-readable reason why a link is considered broken."""
+    if isinstance(status, str):
+        return status
+    if status in STATUS_REASONS:
+        return STATUS_REASONS[status]
+    if 300 <= status < 400:
+        return f"Redirect ({status})"
+    if 400 <= status < 500:
+        return f"Client error ({status})"
+    if status >= 500:
+        return f"Server error ({status})"
+    return f"OK ({status})"
+
+
+def describe_exception(exc: Exception) -> str:
+    """Network errors explained in plain language."""
+    import requests.exceptions as rex
+
+    if isinstance(exc, rex.SSLError):
+        return "SSL certificate error (site has invalid HTTPS)"
+    if isinstance(exc, rex.ConnectTimeout):
+        return "Connection timeout - server is not responding"
+    if isinstance(exc, rex.ReadTimeout):
+        return "Read timeout - server started replying but never finished"
+    if isinstance(exc, rex.TooManyRedirects):
+        return "Redirect loop (the link keeps bouncing in circles)"
+    if isinstance(exc, rex.InvalidURL) or isinstance(exc, rex.MissingSchema):
+        return "Malformed URL (typo in the href)"
+    if isinstance(exc, rex.ConnectionError):
+        text = str(exc)
+        if "NameResolutionError" in text or "getaddrinfo" in text or "Name or service" in text:
+            return "Domain does not exist / DNS does not resolve"
+        if "RemoteDisconnected" in text or "ConnectionResetError" in text:
+            return "Server dropped the connection"
+        return "Could not connect to the server"
+    return f"Error: {type(exc).__name__}: {str(exc)[:150]}"
+
+
+# ----------------------------------------------------------------------------
+# Data model
+# ----------------------------------------------------------------------------
+
+# How to explain where exactly a link was found and whether it is visible
+SOURCE_LABELS = {
+    "a": ("link on the page", True),
+    "area": ("clickable area on an image map", True),
+    "form": ("form (submit target)", True),
+    "img": ("image", True),
+    "iframe": ("embedded iframe", True),
+    "frame": ("frame", True),
+    "video": ("video", True),
+    "audio": ("audio", True),
+    "source": ("media source", True),
+    "track": ("subtitles", False),
+    "embed": ("embedded object", True),
+    "object": ("embedded object", True),
+    "script": ("script (not visible on the page)", False),
+}
+
+LINK_REL_LABELS = {
+    "canonical": ("canonical in <head> - technical, not visible on the page", False),
+    "alternate": ("hreflang in <head> - SEO tag, NOT visible on the page", False),
+    "stylesheet": ("CSS stylesheet (not visible on the page)", False),
+    "icon": ("site icon", False),
+    "preload": ("resource preload", False),
+    "prefetch": ("resource prefetch", False),
+    "dns-prefetch": ("browser hint", False),
+    "preconnect": ("browser hint", False),
+    "amphtml": ("AMP version of the page", False),
+    "next": ("pagination link", False),
+    "prev": ("pagination link", False),
+}
+
+
+def points_at_page(tag: str, rel: str = "") -> bool:
+    """
+    Does this link point at a page (rather than at a loaded resource)?
+
+    True for <a>/<area>/<form> and for <head> tags that reference pages:
+    hreflang, canonical, pagination. False for stylesheets, icons, images.
+    """
+    if tag in NAVIGATION_TAGS:
+        return True
+    if tag == "link":
+        return any(r in PAGE_LEVEL_RELS for r in (rel or "").lower().split())
+    return False
+
+
+def describe_source(tag: str, rel: str = "") -> tuple[str, bool]:
+    """
+    Plain-language explanation of where a link was found.
+    Returns (description, whether it is visible on the page).
+    """
+    if tag == RAW_TAG:
+        return ("inside page source (script/JSON) - not visible on the page", False)
+    if tag == "link":
+        for key in (rel or "").lower().split():
+            if key in LINK_REL_LABELS:
+                return LINK_REL_LABELS[key]
+        return (f"<link{' rel=' + rel if rel else ''}> tag in <head> - technical", False)
+    return SOURCE_LABELS.get(tag, (f"<{tag}> tag", True))
+
+
+@dataclass
+class LinkHit:
+    page: str          # page it was found on
+    href: str          # exactly as written in the code
+    absolute: str      # absolute URL
+    text: str          # link text / alt / caption
+    tag: str           # a, img, link, script, RAW_TAG ...
+    context: str = ""  # surrounding snippet (for source matches)
+    rel: str = ""      # rel attribute of <link> - it defines the meaning
+    status: object = None  # status of the found link itself (filled during search)
+
+    @property
+    def where(self) -> str:
+        return describe_source(self.tag, self.rel)[0]
+
+    @property
+    def visible(self) -> bool:
+        return describe_source(self.tag, self.rel)[1]
+
+
+@dataclass
+class PageInfo:
+    url: str
+    status: object = None
+    final_url: str = ""
+    title: str = ""
+    content_type: str = ""
+    links_count: int = 0
+    error: str = ""
+
+
+@dataclass
+class Options:
+    domain: str
+    mode: str = "search"                  # search | broken | pages | full
+    query: str = ""                       # what to look for
+    match: str = "contains"               # contains | exact | regex
+    limit: int | None = None              # max pages
+    max_depth: int | None = None          # crawl depth
+    workers: int = 10
+    delay: float = 0.0                    # pause between requests, seconds
+    include_subdomains: bool = False
+    use_sitemap: bool = True
+    use_crawl: bool = True
+    check_external: bool = False          # check external links for breakage
+    check_assets: bool = False            # check images/scripts/css
+    search_raw_html: bool = True          # also search raw HTML (JS, JSON)
+    exclude: list[str] = field(default_factory=list)  # URL patterns to skip
+
+
+# ----------------------------------------------------------------------------
+# Main class
+# ----------------------------------------------------------------------------
+
+class SiteAuditor:
+    def __init__(
+        self,
+        opts: Options,
+        on_log: Callable[[str], None] | None = None,
+        on_progress: Callable[[str, int, int], None] | None = None,
+        stop_event: threading.Event | None = None,
+    ):
+        self.opts = opts
+        self.root = normalize_domain(opts.domain)
+        self.root_netloc = urlparse(self.root).netloc
+        self.root_reg = registrable(self.root_netloc)
+
+        self._log_cb = on_log or (lambda m: None)
+        self._progress_cb = on_progress or (lambda p, d, t: None)
+        self.stop_event = stop_event or threading.Event()
+
+        self._local = threading.local()
+        self._lock = threading.Lock()
+
+        # results
+        self.pages: dict[str, PageInfo] = {}
+        self.all_links: list[LinkHit] = []
+        self.search_hits: list[LinkHit] = []
+        self.broken: list[dict] = []
+        self.redirects: list[dict] = []
+        self.status_cache: dict[str, object] = {}
+        self.sitemap_count = 0
+        self.started_at = None
+        self.finished_at = None
+
+    # -- infrastructure ------------------------------------------------------
+
+    def log(self, msg: str) -> None:
+        self._log_cb(msg)
+
+    def progress(self, phase: str, done: int, total: int) -> None:
+        self._progress_cb(phase, done, total)
+
+    @property
+    def session(self) -> requests.Session:
+        """One session per thread - keep-alive speeds the crawl up massively."""
+        s = getattr(self._local, "session", None)
+        if s is None:
+            s = requests.Session()
+            s.headers.update({
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            })
+            self._local.session = s
+        return s
+
+    def stopped(self) -> bool:
+        return self.stop_event.is_set()
+
+    # -- filters -------------------------------------------------------------
+
+    def in_scope(self, url: str) -> bool:
+        """Does this URL belong to our domain?"""
+        try:
+            netloc = urlparse(url).netloc.lower()
+        except Exception:
+            return False
+        if not netloc:
+            return False
+        if self.opts.include_subdomains:
+            return registrable(netloc) == self.root_reg
+        a, b = netloc.split(":")[0], self.root_netloc.lower().split(":")[0]
+        return a == b or a == "www." + b or "www." + a == b
+
+    def excluded(self, url: str) -> bool:
+        return any(pat and pat.lower() in url.lower() for pat in self.opts.exclude)
+
+    # -- source discovery ----------------------------------------------------
+
+    def sitemap_candidates(self) -> list[str]:
+        """Sitemaps from robots.txt plus the standard paths."""
+        found = []
+        robots = urljoin(self.root + "/", "robots.txt")
+        try:
+            r = self.session.get(robots, timeout=TIMEOUT)
+            if r.status_code == 200:
+                for line in r.text.splitlines():
+                    if line.lower().startswith("sitemap:"):
+                        sm = line.split(":", 1)[1].strip()
+                        if sm:
+                            found.append(sm)
+                if found:
+                    self.log(f"  robots.txt points to {len(found)} sitemap "
+                             f"{pl(len(found), 'file')}")
+        except Exception:
+            pass
+        for name in ("sitemap.xml", "sitemap_index.xml", "sitemap-index.xml", "sitemap/sitemap.xml"):
+            found.append(urljoin(self.root + "/", name))
+        # de-duplicate, keep order
+        seen, out = set(), []
+        for u in found:
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    def collect_sitemap_urls(self) -> list[str]:
+        """Recursively expands sitemap indexes (common on larger sites)."""
+        found: set[str] = set()
+        to_check = deque(self.sitemap_candidates())
+        checked: set[str] = set()
+
+        while to_check and not self.stopped():
+            sm_url = to_check.popleft()
+            if sm_url in checked or len(checked) > 200:
+                continue
+            checked.add(sm_url)
+            try:
+                r = self.session.get(sm_url, timeout=TIMEOUT)
+                if r.status_code != 200:
+                    continue
+                root_el = ET.fromstring(r.content)
+            except ET.ParseError:
+                continue
+            except Exception:
+                continue
+
+            tag = root_el.tag.split("}")[-1]
+            locs = [
+                el.text.strip()
+                for el in root_el.iter()
+                if el.tag.split("}")[-1] == "loc" and el.text
+            ]
+            if tag == "sitemapindex":
+                self.log(f"  sitemap index: {sm_url} -> {len(locs)} nested")
+                for loc in locs:
+                    if loc not in checked:
+                        to_check.append(loc)
+            else:
+                before = len(found)
+                found.update(locs)
+                if len(found) > before:
+                    self.log(f"  {sm_url}: +{len(found) - before} URLs")
+
+        return sorted(found)
+
+    # -- page download -------------------------------------------------------
+
+    def fetch(self, url: str) -> tuple[PageInfo, str]:
+        """Downloads a page. Returns (PageInfo, html text)."""
+        info = PageInfo(url=url)
+        try:
+            r = self.session.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True)
+            info.status = r.status_code
+            info.final_url = r.url
+            ctype = r.headers.get("Content-Type", "")
+            info.content_type = ctype.split(";")[0].strip()
+
+            if "html" not in ctype.lower():
+                r.close()
+                return info, ""
+
+            chunks, size = [], 0
+            for chunk in r.iter_content(65536):
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_BODY_BYTES:
+                    break
+            r.close()
+            encoding = r.encoding or r.apparent_encoding or "utf-8"
+            text = b"".join(chunks).decode(encoding, errors="replace")
+            return info, text
+        except Exception as e:
+            info.status = "ERROR"
+            info.error = describe_exception(e)
+            return info, ""
+
+    def extract_links(self, page_url: str, html_text: str) -> tuple[list[LinkHit], str]:
+        """Pulls every link off a page. Returns (links, title)."""
+        hits: list[LinkHit] = []
+        try:
+            soup = BeautifulSoup(html_text, "html.parser")
+        except Exception:
+            return hits, ""
+
+        title = soup.title.get_text(strip=True)[:200] if soup.title else ""
+
+        for tag_name, attr in LINK_SOURCES.items():
+            for el in soup.find_all(tag_name):
+                raw = el.get(attr)
+                if not raw or not isinstance(raw, str):
+                    continue
+                raw = raw.strip()
+                if not raw or raw.lower().startswith(SKIP_SCHEMES):
+                    continue
+                # for <link> keep only the meaningful rel values
+                rel = ""
+                if tag_name == "link":
+                    rel = " ".join(el.get("rel") or []).lower()
+                    if not any(k in ALLOWED_LINK_RELS for k in rel.split()):
+                        continue
+                cleaned = clean_url(raw)
+                if not cleaned:
+                    continue
+                try:
+                    absolute = urljoin(page_url, cleaned)
+                except Exception:
+                    continue
+                if not absolute.lower().startswith(("http://", "https://")):
+                    continue
+
+                text = (
+                    el.get_text(strip=True)[:200]
+                    if tag_name in ("a", "area")
+                    else (el.get("alt") or el.get("title") or "")[:200]
+                )
+                # for hreflang tags it helps to see which language it points at
+                if tag_name == "link" and el.get("hreflang"):
+                    text = f"hreflang={el.get('hreflang')}"
+
+                hits.append(LinkHit(
+                    page=page_url, href=raw, absolute=absolute,
+                    text=text, tag=tag_name, rel=rel,
+                ))
+        return hits, title
+
+    # -- phase 1: crawl ------------------------------------------------------
+
+    def crawl(self) -> None:
+        seeds: list[str] = [self.root]
+
+        if self.opts.use_sitemap:
+            self.log("Looking for sitemap.xml and robots.txt ...")
+            sm = self.collect_sitemap_urls()
+            in_scope = [u for u in sm if self.in_scope(u)]
+            self.log(f"Sitemap gave {len(in_scope)} pages on this domain "
+                     f"({len(sm)} entries in total)")
+            self.sitemap_count = len(in_scope)
+            seeds.extend(in_scope)
+        if not self.opts.use_crawl and len(seeds) == 1:
+            self.log("Sitemap is empty and link crawling is off - enabling the crawl anyway.")
+            self.opts.use_crawl = True
+
+        # queue: (url, depth)
+        queue: deque[tuple[str, int]] = deque()
+        queued: set[str] = set()
+        for s in seeds:
+            k = url_key(s)
+            if k not in queued and not self.excluded(s):
+                queued.add(k)
+                queue.append((clean_url(s), 0))
+
+        self.log(f"Starting queue: {len(queue)} addresses. Crawling ...")
+        limit = self.opts.limit
+        processed = 0
+        discovered = 0     # new addresses queued since the last report
+        explained = False  # the note about the growing queue is printed once
+
+        def handle(item: tuple[str, int]) -> tuple[PageInfo, list[LinkHit], int]:
+            url, depth = item
+            if self.opts.delay:
+                time.sleep(self.opts.delay)
+            info, text = self.fetch(url)
+            links, title = self.extract_links(url, text) if text else ([], "")
+            info.title = title
+            info.links_count = len(links)
+            if self.opts.search_raw_html and text and self.opts.query:
+                known = {url_key(l.absolute) for l in links}
+                links.extend(self.scan_raw_html(url, text, known))
+            return info, links, depth
+
+        with ThreadPoolExecutor(max_workers=self.opts.workers) as pool:
+            while queue and not self.stopped():
+                if limit and processed >= limit:
+                    self.log(f"Reached the limit of {limit} pages - stopping the crawl.")
+                    break
+
+                batch: list[tuple[str, int]] = []
+                batch_size = self.opts.workers * 3
+                while queue and len(batch) < batch_size:
+                    if limit and processed + len(batch) >= limit:
+                        break
+                    batch.append(queue.popleft())
+                if not batch:
+                    break
+
+                for info, links, depth in pool.map(handle, batch):
+                    processed += 1
+                    self.pages[info.url] = info
+                    self.status_cache[info.url] = info.status if not info.error else info.error
+
+                    with self._lock:
+                        self.all_links.extend(links)
+
+                    # only navigation links extend the queue
+                    if self.opts.use_crawl and not self.stopped():
+                        if self.opts.max_depth is not None and depth >= self.opts.max_depth:
+                            continue
+                        for lk in links:
+                            if lk.tag not in NAVIGATION_TAGS:
+                                continue
+                            tgt = lk.absolute
+                            if not self.in_scope(tgt) or self.excluded(tgt):
+                                continue
+                            if not is_page_like(tgt):
+                                continue
+                            k = url_key(tgt)
+                            if k in queued:
+                                continue
+                            queued.add(k)
+                            # queue the address without tracking tags so the same
+                            # page is never downloaded twice
+                            queue.append((strip_tracking(tgt), depth + 1))
+                            discovered += 1
+
+                total_known = processed + len(queue)
+                self.progress("crawl", processed, min(total_known, limit) if limit else total_known)
+
+                if discovered and not explained:
+                    explained = True
+                    self.log("  (crawled pages link to pages that were not on the list yet - "
+                             "those get added to the queue, which is why it grows at first)")
+                added = (
+                    f", queued {discovered} more {pl(discovered, 'address', 'addresses')}"
+                    if discovered else ""
+                )
+                self.log(f"  pages crawled: {processed}, left in queue: {len(queue)}{added}")
+                discovered = 0
+
+        extra = len(queued) - self.sitemap_count
+        if self.opts.use_crawl and extra > 0:
+            self.log(f"Beyond the sitemap, the crawl found {extra} more {pl(extra, 'page')}.")
+        self.log(f"Crawl finished: {len(self.pages)} {pl(len(self.pages), 'page')}, "
+                 f"{len(self.all_links)} links collected.")
+
+    # -- phase 2: search -----------------------------------------------------
+
+    def scan_raw_html(self, page_url: str, text: str, known: set[str]) -> list[LinkHit]:
+        """
+        Searches the HTML source directly - catches links inside <script>, JSON
+        and data attributes where there is no <a> tag at all.
+
+        We do not match "a substring anywhere", only URL-like chunks: otherwise
+        a query such as 'privacy' would match every word in the page text.
+        """
+        q = self.opts.query
+        if not q:
+            return []
+
+        try:
+            rx = re.compile(q, re.I) if self.opts.match == "regex" else None
+        except re.error:
+            return []
+        target_key = url_key(query_to_url(q, self.root))
+        needle = q.lower()
+
+        def matches(candidate: str) -> bool:
+            if rx is not None:
+                return bool(rx.search(candidate))
+            if self.opts.match == "exact":
+                return url_key(urljoin(page_url, candidate)) == target_key
+            return needle in candidate.lower()
+
+        hits: list[LinkHit] = []
+        seen: set[str] = set()
+
+        for m in list(RAW_URL_RE.finditer(text)) + list(RAW_REL_RE.finditer(text)):
+            raw = (m.group(1) if m.lastindex else m.group(0)).rstrip(".,;)")
+            raw = html.unescape(raw)
+            if not matches(raw):
+                continue
+            try:
+                absolute = urljoin(page_url, clean_url(raw))
+            except Exception:
+                continue
+            key = url_key(absolute)
+            # if a tag on this same page already gave us this link, skip it
+            if key in known or key in seen:
+                continue
+            seen.add(key)
+            start, end = max(0, m.start() - 80), min(len(text), m.end() + 80)
+            context = re.sub(r"\s+", " ", text[start:end]).strip()
+            hits.append(LinkHit(
+                page=page_url, href=raw, absolute=absolute,
+                text="", tag=RAW_TAG, context=context,
+            ))
+            if len(hits) >= 15:
+                break
+        return hits
+
+    def run_search(self) -> None:
+        q = self.opts.query
+        if not q:
+            return
+        mode = self.opts.match
+        self.log(f"Searching for '{q}' (mode: {mode}) across {len(self.all_links)} links ...")
+
+        if mode == "regex":
+            try:
+                rx = re.compile(q, re.I)
+            except re.error as e:
+                self.log(f"Invalid regular expression: {e}")
+                return
+        target_key = url_key(query_to_url(q, self.root))
+        needle = q.lower()
+        if mode == "exact":
+            self.log(f"  exact match resolved to: {query_to_url(q, self.root)}")
+
+        seen: set[tuple] = set()
+        for lk in self.all_links:
+            if lk.tag == RAW_TAG:
+                matched = True  # already filtered during the source scan
+            elif mode == "exact":
+                matched = url_key(lk.absolute) == target_key
+            elif mode == "regex":
+                matched = bool(rx.search(lk.href) or rx.search(lk.absolute) or rx.search(lk.text or ""))
+            else:
+                matched = needle in lk.href.lower() or needle in lk.absolute.lower()
+
+            if matched:
+                sig = (lk.page, lk.href, lk.absolute, lk.tag, lk.context[:60])
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                self.search_hits.append(lk)
+
+        pages_with = len({h.page for h in self.search_hits})
+        self.log(f"Found {len(self.search_hits)} {pl(len(self.search_hits), 'match', 'matches')} "
+                 f"on {pages_with} {pl(pages_with, 'page')}.")
+
+        if not self.search_hits:
+            return
+
+        visible = sum(1 for h in self.search_hits if h.visible)
+        if visible == 0:
+            self.log("  NOTE: no matches among visible links - everything was found in "
+                     "technical tags (<head>, scripts). You will not spot it on the page.")
+
+        # Check whether the found link itself is alive: people often search for
+        # an address that no longer exists.
+        unique = list({h.absolute for h in self.search_hits})
+        if len(unique) > 500:
+            self.log(f"  {len(unique)} distinct addresses found - skipping status checks "
+                     f"(too many), use the 'Broken links' mode instead")
+            return
+        self.log(f"Checking whether the found addresses work ({len(unique)}) ...")
+        with ThreadPoolExecutor(max_workers=self.opts.workers) as pool:
+            for url, status in zip(unique, pool.map(self.check_link, unique)):
+                self.status_cache[url] = status
+        for h in self.search_hits:
+            h.status = self.status_cache.get(h.absolute)
+
+        dead = {
+            u for u in unique
+            if isinstance(self.status_cache.get(u), str)
+            or (isinstance(self.status_cache.get(u), int) and self.status_cache[u] >= 400)
+        }
+        if dead:
+            self.log(f"  NOTE: {len(dead)} of the found addresses "
+                     f"{pl(len(dead), 'does', 'do')} not work:")
+            for u in list(dead)[:5]:
+                self.log(f"    {u} - {describe_status(self.status_cache[u])}")
+
+    # -- phase 3: broken links -----------------------------------------------
+
+    def check_link(self, url: str) -> object:
+        try:
+            r = self.session.head(url, timeout=TIMEOUT, allow_redirects=True)
+            if r.status_code in (400, 403, 405, 501) or r.status_code >= 500:
+                # some servers do not handle HEAD - retry with GET
+                r = self.session.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True)
+                r.close()
+            return r.status_code
+        except Exception as e:
+            return describe_exception(e)
+
+    def run_broken_check(self) -> None:
+        targets: dict[str, list[LinkHit]] = {}
+        for lk in self.all_links:
+            if lk.tag == RAW_TAG:
+                continue
+            # page links (<a> and <head> pointers such as hreflang/canonical) are
+            # always checked; images, css and scripts only on request
+            if not self.opts.check_assets and not points_at_page(lk.tag, lk.rel):
+                continue
+            internal = self.in_scope(lk.absolute)
+            if not internal and not self.opts.check_external:
+                continue
+            targets.setdefault(lk.absolute, []).append(lk)
+
+        # anything already downloaded during the crawl is not requested again
+        to_check = [u for u in targets if u not in self.status_cache]
+        self.log(f"Checking {len(to_check)} unique links "
+                 f"({len(targets) - len(to_check)} already known from the crawl) ...")
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=self.opts.workers) as pool:
+            for url, status in zip(to_check, pool.map(self.check_link, to_check)):
+                self.status_cache[url] = status
+                done += 1
+                if done % 25 == 0 or done == len(to_check):
+                    self.progress("check", done, len(to_check))
+                    self.log(f"  checked {done}/{len(to_check)}")
+                if self.stopped():
+                    break
+
+        for url, hits in targets.items():
+            status = self.status_cache.get(url)
+            if status is None:
+                continue
+            is_broken = isinstance(status, str) or (isinstance(status, int) and status >= 400)
+            if not is_broken:
+                continue
+            reason = describe_status(status)
+            scope = "internal" if self.in_scope(url) else "external"
+            # the same link often sits on a page several times (menu + footer) -
+            # collapse those into one row with a counter
+            seen_rows: dict[tuple, dict] = {}
+            for lk in hits:
+                sig = (lk.page, lk.text, lk.tag, lk.rel)
+                if sig in seen_rows:
+                    seen_rows[sig]["count"] += 1
+                    continue
+                seen_rows[sig] = {
+                    "page": lk.page,
+                    "link": url,
+                    "status": status if isinstance(status, int) else "ERROR",
+                    "reason": reason,
+                    "text": lk.text,
+                    "tag": lk.tag,
+                    "where": lk.where,
+                    "visible": lk.visible,
+                    "scope": scope,
+                    "href": lk.href,
+                    "count": 1,
+                }
+            self.broken.extend(seen_rows.values())
+
+        self.broken.sort(key=lambda r: (str(r["status"]), r["link"]))
+        self.log(f"Broken links: {len(self.broken)} "
+                 f"({len({b['link'] for b in self.broken})} unique addresses)")
+
+        hidden = [b for b in self.broken if not b["visible"]]
+        if hidden:
+            uniq = len({b["link"] for b in hidden})
+            self.log(f"  of those, {len(hidden)} sit in technical tags "
+                     f"(<head> hreflang/canonical, scripts) - {uniq} unique "
+                     f"{pl(uniq, 'address', 'addresses')} you cannot spot on the page")
+
+    # -- run -----------------------------------------------------------------
+
+    def run(self) -> dict:
+        self.started_at = datetime.now()
+        mode = self.opts.mode
+        self.log(f"=== Start: {self.root} | mode: {mode} ===")
+
+        self.crawl()
+
+        if not self.stopped() and mode in ("search", "full") and self.opts.query:
+            self.run_search()
+
+        if not self.stopped() and mode in ("broken", "full"):
+            self.run_broken_check()
+
+        self.finished_at = datetime.now()
+        elapsed = (self.finished_at - self.started_at).total_seconds()
+        self.log(f"=== Done in {elapsed:.0f}s ===")
+        return self.summary()
+
+    def summary(self) -> dict:
+        return {
+            "domain": self.root,
+            "mode": self.opts.mode,
+            "query": self.opts.query,
+            "pages": len(self.pages),
+            "links": len([l for l in self.all_links if l.tag != RAW_TAG]),
+            "hits": len(self.search_hits),
+            "hit_pages": len({h.page for h in self.search_hits}),
+            "broken": len(self.broken),
+            "broken_unique": len({b["link"] for b in self.broken}),
+            "elapsed": (
+                (self.finished_at - self.started_at).total_seconds()
+                if self.started_at and self.finished_at else 0
+            ),
+            "stopped": self.stopped(),
+        }
+
+
+# ----------------------------------------------------------------------------
+# Excel export
+# ----------------------------------------------------------------------------
+
+def export_xlsx(auditor: SiteAuditor, path: str) -> str:
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    head_font = Font(bold=True, color="FFFFFF")
+    head_fill = PatternFill("solid", fgColor="2F4858")
+
+    wb = openpyxl.Workbook()
+
+    def make_sheet(title: str, headers: list[str], rows: Iterable[tuple], widths: list[int], first=False):
+        ws = wb.active if first else wb.create_sheet()
+        ws.title = title[:31]
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font = head_font
+            cell.fill = head_fill
+            cell.alignment = Alignment(vertical="center")
+        for row in rows:
+            ws.append(row)
+        for i, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+        ws.freeze_panes = "A2"
+        if ws.max_row > 1:
+            ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{ws.max_row}"
+        return ws
+
+    s = auditor.summary()
+    make_sheet(
+        "Summary",
+        ["Metric", "Value"],
+        [
+            ("Domain", s["domain"]),
+            ("Mode", s["mode"]),
+            ("Searched for", s["query"] or "-"),
+            ("Pages crawled", s["pages"]),
+            ("Links collected", s["links"]),
+            ("Matches found", s["hits"]),
+            ("Pages with matches", s["hit_pages"]),
+            ("Broken links (occurrences)", s["broken"]),
+            ("Broken links (unique)", s["broken_unique"]),
+            ("Duration, seconds", round(s["elapsed"])),
+            ("Date", datetime.now().strftime("%Y-%m-%d %H:%M")),
+        ],
+        [32, 70],
+        first=True,
+    )
+
+    if auditor.search_hits:
+        make_sheet(
+            "Where the link was found",
+            ["Page holding the link", "Full link", "Where exactly",
+             "On the page / technical", "Link status", "Link or button text",
+             "href as written", "Source context"],
+            [
+                (h.page, h.absolute, h.where, "on the page" if h.visible else "technical",
+                 describe_status(h.status) if h.status is not None else "not checked",
+                 h.text, h.href, h.context)
+                for h in auditor.search_hits
+            ],
+            [55, 55, 46, 22, 40, 28, 45, 60],
+        )
+
+    if auditor.broken:
+        make_sheet(
+            "Broken links",
+            ["Page holding the link", "Broken link", "Code", "Reason",
+             "Where exactly", "On the page / technical", "Link or button text",
+             "Scope", "Times on page"],
+            [
+                (b["page"], b["link"], b["status"], b["reason"], b["where"],
+                 "on the page" if b["visible"] else "technical",
+                 b["text"], b["scope"], b.get("count", 1))
+                for b in auditor.broken
+            ],
+            [52, 52, 8, 42, 46, 22, 28, 10, 14],
+        )
+
+    make_sheet(
+        "All pages",
+        ["Page URL", "Status", "Title", "Links on page", "Content type", "Error"],
+        [
+            (p.url, p.status, p.title, p.links_count, p.content_type, p.error)
+            for p in sorted(auditor.pages.values(), key=lambda x: x.url)
+        ],
+        [70, 10, 50, 18, 22, 40],
+    )
+
+    wb.save(path)
+    return path

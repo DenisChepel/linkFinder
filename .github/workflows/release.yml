@@ -1,0 +1,91 @@
+# Builds the Windows .exe on GitHub and attaches it to a Release.
+#
+# Trigger it by pushing a version tag:
+#     git tag v2.5
+#     git push origin v2.5
+#
+# It can also be started by hand from the Actions tab (workflow_dispatch).
+name: Build and release Windows exe
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to create the release and upload the file
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build the executable
+        run: >
+          python -m PyInstaller
+          --onefile
+          --name SiteLinkFinder
+          --add-data "static;static"
+          --clean
+          --noconfirm
+          app.py
+
+      - name: Check that the built exe actually starts and serves the UI
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD "dist\SiteLinkFinder.exe"
+          if (-not (Test-Path $exe)) { throw "exe was not produced" }
+
+          # run it from an empty folder: that is how a colleague will run it,
+          # and it proves nothing is silently read from the source tree
+          $sandbox = Join-Path $env:RUNNER_TEMP "smoke"
+          New-Item -ItemType Directory -Force -Path $sandbox | Out-Null
+          Copy-Item $exe $sandbox
+          $env:BROWSER = "none"     # keep the runner from opening a browser
+          Start-Process -FilePath (Join-Path $sandbox "SiteLinkFinder.exe") -WorkingDirectory $sandbox
+
+          $ok = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 2
+            try {
+              $status = Invoke-RestMethod "http://127.0.0.1:8765/api/status?since=0" -TimeoutSec 3
+              $page = Invoke-WebRequest "http://127.0.0.1:8765/" -TimeoutSec 5
+              $css = Invoke-WebRequest "http://127.0.0.1:8765/static/css/style.css" -TimeoutSec 5
+              if ($page.Content -match "Site Link Finder" -and $css.StatusCode -eq 200) {
+                Write-Host "exe serves the UI, version $($status.version)"
+                $ok = $true
+                break
+              }
+            } catch { }
+          }
+          Stop-Process -Name SiteLinkFinder -Force -ErrorAction SilentlyContinue
+          if (-not $ok) { throw "the exe did not serve the interface" }
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/SiteLinkFinder.exe
+            dist/HOW-TO-USE.txt
+          generate_release_notes: true
+          body: |
+            **Download `SiteLinkFinder.exe` below and run it — nothing to install.**
+
+            Windows 10/11, 64-bit. On first launch Windows SmartScreen may warn that
+            the file is unsigned: choose *More info → Run anyway*.
+
+            `HOW-TO-USE.txt` is a short usage guide for anyone new to the tool.

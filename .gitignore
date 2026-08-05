@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller build artefacts (regenerate with build_exe.bat)
+build/
+*.spec
+
+# The executable is not stored in git - GitHub Actions builds it and attaches
+# it to a Release when a version tag is pushed. See .github/workflows/release.yml
+dist/*.exe
+
+# Scan reports produced at runtime
+results/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Site Link Finder</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <h1>🔎 Site Link Finder</h1>
+  <span class="topbar__sub">crawl a whole domain · locate a link · broken links with reasons</span>
+  <span class="topbar__version" id="version"></span>
+</header>
+
+<main class="page">
+
+  <!-- ===================== settings ===================== -->
+  <section class="card">
+    <h2 class="card__title">1 · What to do</h2>
+
+    <div class="modes" id="modes">
+      <label class="mode is-active" data-mode="search">
+        <input type="radio" name="mode" value="search" checked>
+        <span class="mode__name">🎯 Find a link</span>
+        <span class="mode__desc">Crawl the site and show every page that holds the link you need</span>
+      </label>
+
+      <label class="mode" data-mode="broken">
+        <input type="radio" name="mode" value="broken">
+        <span class="mode__name">💔 Broken links</span>
+        <span class="mode__desc">Find every dead link: address, reason and the page it sits on</span>
+      </label>
+
+      <label class="mode" data-mode="pages">
+        <input type="radio" name="mode" value="pages">
+        <span class="mode__name">🗺️ Site map</span>
+        <span class="mode__desc">Just collect every page of the domain with its status code</span>
+      </label>
+    </div>
+
+    <h2 class="card__title">2 · Settings</h2>
+
+    <div class="grid-2">
+      <div class="field">
+        <label class="field__label" for="domain">Site domain</label>
+        <input type="text" id="domain" placeholder="example.com" autocomplete="off">
+        <p class="field__hint">https:// is optional — it gets added automatically</p>
+      </div>
+
+      <div class="field" id="queryField">
+        <label class="field__label" for="query">Which link to find</label>
+        <input type="text" id="query" placeholder="/old-page or a full URL" autocomplete="off">
+        <p class="field__hint">A fragment works too — it finds every link containing it</p>
+      </div>
+    </div>
+
+    <div class="grid-2" id="matchRow">
+      <div class="field">
+        <label class="field__label" for="match">How to compare</label>
+        <select id="match">
+          <option value="contains">Contains — matches any occurrence (recommended)</option>
+          <option value="exact">Exact URL — ignores www / http / trailing slash</option>
+          <option value="regex">Regular expression — for tricky cases</option>
+        </select>
+      </div>
+      <div class="field"></div>
+    </div>
+
+    <details class="advanced">
+      <summary class="advanced__summary">Advanced settings</summary>
+      <div class="advanced__body">
+
+        <div class="checks">
+          <label class="check">
+            <input type="checkbox" id="search_raw_html" checked>
+            <span class="check__text">
+              <b>Search the page source too</b>
+              <i>catches links inside scripts and JS-driven buttons</i>
+            </span>
+          </label>
+
+          <label class="check">
+            <input type="checkbox" id="use_sitemap" checked>
+            <span class="check__text">
+              <b>Use sitemap.xml</b>
+              <i>fast start: takes the ready-made page list</i>
+            </span>
+          </label>
+
+          <label class="check">
+            <input type="checkbox" id="use_crawl" checked>
+            <span class="check__text">
+              <b>Follow links</b>
+              <i>finds pages that are missing from the sitemap</i>
+            </span>
+          </label>
+
+          <label class="check">
+            <input type="checkbox" id="include_subdomains">
+            <span class="check__text">
+              <b>Include subdomains</b>
+              <i>blog.site.com, info.site.com and so on</i>
+            </span>
+          </label>
+
+          <label class="check">
+            <input type="checkbox" id="check_external">
+            <span class="check__text">
+              <b>Check external links</b>
+              <i>links to other sites — slower but complete</i>
+            </span>
+          </label>
+
+          <label class="check">
+            <input type="checkbox" id="check_assets">
+            <span class="check__text">
+              <b>Check images and scripts</b>
+              <i>also finds broken images, css and js. Links in &lt;head&gt; are checked anyway</i>
+            </span>
+          </label>
+        </div>
+
+        <div class="grid-2">
+          <div class="field">
+            <label class="field__label" for="workers">Threads (speed)</label>
+            <input type="number" id="workers" value="10" min="1" max="32">
+            <p class="field__hint">More is faster. Getting 429 errors? Drop to 3–5</p>
+          </div>
+          <div class="field">
+            <label class="field__label" for="max_depth">Crawl depth</label>
+            <input type="number" id="max_depth" placeholder="empty = unlimited" min="0">
+            <p class="field__hint">0 — start pages only, 2 — two clicks from home</p>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div class="field">
+            <label class="field__label" for="delay">Pause between requests, sec</label>
+            <input type="number" id="delay" value="0" min="0" step="0.1">
+            <p class="field__hint">0.2–0.5 if the site starts blocking you</p>
+          </div>
+          <div class="field">
+            <label class="field__label" for="exclude">Skip addresses containing</label>
+            <input type="text" id="exclude" placeholder="/tag/, ?page=, /author/">
+            <p class="field__hint">Comma separated. Saves time on pagination</p>
+          </div>
+        </div>
+
+      </div>
+    </details>
+
+    <div class="actions">
+      <button class="btn btn--primary" id="startBtn">Start</button>
+      <button class="btn btn--danger" id="stopBtn" disabled>Stop</button>
+    </div>
+  </section>
+
+  <!-- ===================== progress ===================== -->
+  <section class="card" id="progressCard" hidden>
+    <h2 class="card__title">Progress</h2>
+    <div class="bar" id="bar"><i></i></div>
+    <pre class="log" id="log"></pre>
+  </section>
+
+  <!-- ===================== results ===================== -->
+  <section class="card" id="resultsCard" hidden>
+    <h2 class="card__title">Result</h2>
+
+    <div id="errorBox"></div>
+    <div class="stats" id="stats"></div>
+
+    <div class="actions actions--tight">
+      <button class="btn btn--ghost" id="downloadBtn">⬇ Download Excel</button>
+      <button class="btn btn--ghost" id="folderBtn">📁 Results folder</button>
+    </div>
+
+    <div class="tabs" id="tabs"></div>
+    <div class="field field--filter">
+      <input type="text" id="filter" placeholder="Filter the table — type part of an address or text">
+    </div>
+    <div id="tableBox"></div>
+  </section>
+
+</main>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

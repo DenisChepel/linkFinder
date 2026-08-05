@@ -1,0 +1,267 @@
+# Site Link Finder
+
+Crawls an **entire** domain and answers two questions:
+
+1. **Where on the site does this link sit?** — shows every page it appears on.
+2. **Which links are broken?** — shows the address, the **reason** and the page holding it.
+
+---
+
+## Running it
+
+Two ways: from source (needs Python) or as a standalone `.exe` (needs nothing).
+For sharing with someone else, see [Sharing with a colleague](#sharing-with-a-colleague).
+
+**Double-click `run.bat`** — a browser opens with the interface.
+
+If the .bat file does not work, do the same by hand:
+
+```
+python app.py
+```
+
+then open http://127.0.0.1:8765
+
+The libraries (`requests`, `beautifulsoup4`, `openpyxl`) are installed once and the
+.bat file handles that for you. To finish, close the black console window or press
+`Ctrl+C` inside it.
+
+> **Restart the program after a code update.** Python reads `.py` files once, at
+> startup. Until the black window is closed and opened again, the old version keeps
+> running even though the files on disk are new. Easy to verify: the **version is shown
+> on the right of the interface header** (currently `2.2`) and in the console at startup.
+> If it changed, the code is fresh.
+
+---
+
+## Sharing with a colleague
+
+`dist\SiteLinkFinder.exe` is a single self-contained file — **12 MB, no Python, no
+libraries, no installation**. Send that one file and it just runs.
+
+**What the colleague does:** double-click the .exe → a console window opens → the
+browser opens the same interface. Reports land in a `results` folder created next to
+the .exe. To quit, close the console window.
+
+Two things worth warning them about:
+
+- **Windows SmartScreen** may show "Windows protected your PC" the first time, because
+  the file is not code-signed. Click **More info → Run anyway**.
+- **The first launch takes a few seconds** — the app unpacks itself into a temp folder.
+  Later launches are quicker.
+
+Requirements on their side: Windows 10 or 11, 64-bit, and internet access to reach the
+site being scanned. Nothing else.
+
+**Rebuilding after code changes:** run `build_exe.bat` (needs Python and PyInstaller —
+it installs PyInstaller itself if missing). The result is written to `dist\SiteLinkFinder.exe`;
+the `build\` folder is temporary and can be deleted.
+
+---
+
+## Three modes
+
+| Mode | What it does | When you need it |
+|---|---|---|
+| 🎯 **Find a link** | Crawls the site and shows every page holding the link | "What else points at this old URL before I delete the page?" |
+| 💔 **Broken links** | Collects every dead link with a reason | Routine 404 sweep |
+| 🗺️ **Site map** | Just the list of all pages with status codes | You need an inventory of pages — the fastest mode |
+
+---
+
+## How to use it
+
+### Find where a link sits
+
+1. Pick **🎯 Find a link**.
+2. **Site domain**: `example.com` (`https://` optional).
+3. **Which link to find** — any of these forms works:
+   - a fragment: `old-page`
+   - a path: `/blog/old-page`
+   - a full URL: `https://www.example.com/blog/old-page`
+4. Press **Start**.
+
+A table appears: page → the found link → **where exactly it sits** → link text.
+
+#### The "Where exactly" column — read it
+
+A link on a site is not always the one you can see. Every match is tagged:
+
+- **👁 On the page** — a normal link or button, you will find it by looking;
+- **🔧 Technical** — the link only exists in the code, it is **not visible** on the page.
+
+Technical matches are things like:
+
+| Label | What it means |
+|---|---|
+| `hreflang in <head> — SEO tag` | points at another language version, meant for Google |
+| `canonical in <head>` | the "main" address of the page for search engines |
+| `inside page source (script/JSON)` | the link is baked into a script — common for JS-driven buttons |
+| `CSS stylesheet`, `site icon` | attached files |
+
+If a match is tagged **🔧 Technical**, looking for it on the page itself is pointless —
+open the page source instead (`Ctrl+U` in the browser).
+
+#### Status of the found link
+
+Under each address you see whether it works: **✓ works** or **✕ 404**.
+This catches a common case — the link exists on the site but points at a deleted page.
+
+### Find broken links
+
+1. Pick **💔 Broken links**, enter the domain, press Start.
+2. The table shows: page holding the link → the dead link → **reason** →
+   **where exactly** it sits → link text.
+
+Both kinds of links are checked:
+
+- **visible ones** — `<a>` links, buttons, form targets;
+- **the ones in `<head>`** — `hreflang`, `canonical`, pagination. Those are invisible
+  on the page but search engines follow them, so a 404 there is a real defect. They
+  are flagged **🔧 Technical** in the "Where exactly" column.
+
+Images, css and scripts are *not* checked unless you tick "Check images and scripts" —
+otherwise every missing icon would drown out the actual broken pages.
+
+Reasons are written in plain language:
+
+- `Page not found (404) - broken link` — the classic, needs fixing
+- `Domain does not exist / DNS does not resolve` — the target site is gone
+- `Forbidden (403) - often bot protection` — **check manually**, the link is often alive,
+  the site simply dislikes robots
+- `Connection timeout` — no answer from the server, worth a re-check
+- `SSL certificate error` — the target site has an HTTPS problem
+- `Too many requests (429)` — the site is throttling you: drop threads to 3–5 and retry
+
+By default only links inside your own domain are checked. To also check links pointing
+at other sites, tick **"Check external links"** in the advanced settings (slower).
+
+---
+
+## Results
+
+- **In the browser** — filterable tables: the "Filter the table" box instantly narrows
+  rows by any piece of text. Every address is clickable.
+- **Excel** — the "⬇ Download Excel" button. The file is built **only when you click
+  the button**; nothing is saved on its own after a scan. Downloaded reports land in
+  the `results/` folder ("📁 Results folder" opens it).
+
+The workbook has four sheets: *Summary*, *Where the link was found*, *Broken links*,
+*All pages*. Each has an auto-filter, so you can sort right inside Excel.
+
+> The browser shows at most 3000 rows per table so the page stays responsive.
+> **Excel always contains everything** — for large result sets, work with the file.
+
+---
+
+## Advanced settings
+
+| Setting | Why |
+|---|---|
+| **Search the page source too** | Catches links inside scripts and JS-driven buttons with no `<a>` tag. On by default |
+| **Use sitemap.xml** | Fast start: takes the ready-made page list |
+| **Follow links** | Finds pages that are **missing** from the sitemap. Works together with the sitemap |
+| **Include subdomains** | `blog.example.com`, `info.example.com` — needed when a blog or landing pages live on a separate host |
+| **Check external links** | Also checks links pointing at other sites |
+| **Check images and scripts** | Also finds broken images, css and js. Page links in `<head>` (hreflang, canonical) are checked either way |
+| **Threads** | Speed. 10 by default; if the site returns 429, drop to 3–5 |
+| **Crawl depth** | `2` = two clicks from the home page, `0` = start pages only |
+| **Pause between requests** | `0.2–0.5` sec if the site starts blocking you |
+| **Skip addresses containing** | Comma separated: `/tag/, ?page=, /author/` — saves time on pagination |
+
+The **Stop** button interrupts the crawl, but everything gathered so far is kept and
+the Excel file can still be built — nothing is lost.
+
+---
+
+## Reading the crawl log
+
+```
+Starting queue: 1839 addresses. Crawling ...
+  pages crawled: 30, left in queue: 1911, queued 102 more addresses
+  pages crawled: 60, left in queue: 1891, queued 10 more addresses
+```
+
+This is **only about the crawl queue**, not about matches for your query.
+Matches are reported separately, at the end, in the results table.
+
+**Why does the queue grow while pages are being crawled?** That is normal.
+The queue is live: after crawling a page the tool sees links to other pages and queues
+the ones it has not met yet. Over the first 30 pages, 30 addresses left the queue and
+102 were added — hence 1911. The growth then falls off (nearly every link is already
+known) and the queue drains to zero.
+
+Those added addresses are exactly the pages that are **not in the sitemap**.
+On a real 1800-page site this surfaced over a hundred live pages the sitemap never
+listed — `/contact-us` and whole product sections among them. With the sitemap alone
+they would never reach the report.
+
+The same address is never downloaded twice: `www`, `http/https`, a trailing slash and
+tracking tags (`?utm_source=…`, `?_ga=…`, `?fbclid=…`) all count as one address.
+Meaningful parameters (`?page=2`, `?hsLang=en`) are kept — those are different pages.
+
+---
+
+## How long it takes
+
+A site of ~1800 pages: site map takes a couple of minutes, finding a link 2–3 minutes,
+broken links the longest — it depends on how many links there are. Progress and the log
+are visible in the interface, and you can press Stop at any moment.
+
+To get a quick feel for an unfamiliar site, set **crawl depth** to `1` in the advanced settings.
+
+---
+
+## Command line
+
+When you do not need the interface (for scheduled runs, for example):
+
+```bash
+# where a link sits
+python cli.py --domain example.com --find "/blog/old-page"
+
+# every broken link
+python cli.py --domain example.com --mode broken
+
+# search + broken links in one pass, external links included
+python cli.py --domain example.com --find "/old-page" --mode full --check-external
+
+# quick trial run
+python cli.py --domain example.com --mode pages --limit 50
+```
+
+All flags: `python cli.py --help`
+
+> The CLI also offers `--mode full` (search + broken links in a single crawl) and
+> `--limit`. Both were removed from the interface to keep it uncluttered, but kept in
+> the CLI for automation. Unlike the interface, the CLI saves the .xlsx immediately.
+
+---
+
+## Files
+
+| File | What it is |
+|---|---|
+| `run.bat` | One-click launcher |
+| `app.py` | Web server: API and static files |
+| `core.py` | Engine: crawling, search, link checks, Excel export |
+| `cli.py` | Command-line version |
+| `static/index.html` | Interface markup |
+| `static/css/style.css` | Styles |
+| `static/js/app.js` | Front-end logic |
+| `results/` | Finished reports |
+
+---
+
+## Troubleshooting
+
+**Suspiciously few pages found** — the site has no sitemap or an incomplete one.
+Check that "Follow links" is on and try "Include subdomains".
+
+**Lots of 403 links** — the site is defending against bots. Drop threads to 3 and set a
+0.5 sec pause. Such links are usually fine; spot-check a couple by hand.
+
+**Lots of 429** — same thing: 3 threads, 0.5–1 sec pause.
+
+**Takes too long** — set crawl depth to `1`–`2`, or exclude pagination through
+"Skip addresses containing".

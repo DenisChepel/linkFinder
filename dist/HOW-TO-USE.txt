@@ -1,0 +1,61 @@
+SITE LINK FINDER
+================
+
+Crawls a whole website and answers two questions:
+  1. Where on the site does a given link sit?
+  2. Which links are broken, and why?
+
+Nothing needs to be installed. Windows 10/11 64-bit is enough.
+
+
+HOW TO START
+------------
+1. Double-click SiteLinkFinder.exe
+2. A black console window opens and your browser opens the interface.
+   If Windows says "Windows protected your PC": More info -> Run anyway.
+   (That warning only means the file is not code-signed.)
+3. The first launch takes a few seconds while the app unpacks itself.
+4. To quit: close the black console window.
+
+
+HOW TO USE
+----------
+Pick one of three modes at the top:
+
+  Find a link    Enter the domain (e.g. example.com) and the link you are looking
+                 for. A fragment like /old-page works, so does a full URL.
+                 The result shows every page where that link appears.
+
+  Broken links   Enter the domain only. The result lists every dead link, the
+                 reason it is dead, and the page it sits on.
+
+  Site map       Enter the domain only. Returns the list of all pages found.
+
+Then press Start. Progress and a live log appear below; Stop interrupts the scan
+and keeps whatever has been collected so far.
+
+
+READING THE RESULTS
+-------------------
+"Where exactly" column:
+  On the page  - a normal link or button, you can see it by looking at the page
+  Technical    - the link only exists in the code (SEO tags, scripts). Looking for
+                 it on the page itself is pointless; open the page source instead.
+
+Under each found link you also see whether it still works, or the error it returns.
+
+Excel: press "Download Excel". The file is created only when you press that button
+and is also kept in the "results" folder next to the .exe.
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+Very few pages found      The site has no sitemap, or an incomplete one. Open
+                          "Advanced settings" and make sure "Follow links" is on;
+                          try "Include subdomains" too.
+
+Many 403 or 429 errors    The site is throttling robots. In "Advanced settings"
+                          set Threads to 3 and Pause to 0.5 sec, then retry.
+                          403 links are often fine - spot-check a couple by hand.
+
+Scan takes too long       Set "Crawl depth" to 1 or 2 in Advanced settings.

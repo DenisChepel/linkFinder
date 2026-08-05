@@ -1,0 +1,10 @@
+# Normalize line endings in the repository, check out native on each platform
+* text=auto
+
+# Windows batch files break with LF endings - keep CRLF
+*.bat text eol=crlf
+
+# Never touch binaries
+*.exe binary
+*.xlsx binary
+*.ico binary
