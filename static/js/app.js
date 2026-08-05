@@ -24,6 +24,22 @@
 
   const POLL_INTERVAL_MS = 700;
 
+  /* Ranking for the Indexable column: sorting groups the verdicts instead of
+     mixing them, and the groups run from "this is broken" down to "this is
+     fine", so the first click surfaces what needs attention first. */
+  function indexRank(page) {
+    const status = page.index_status || '';
+    if (status === 'Error') return 0;                    // could not be fetched
+    if (/^HTTP 5/.test(status)) return 1;                // server error
+    if (/^HTTP 4/.test(status)) return 2;                // 404 and friends
+    if (/^HTTP 3/.test(status)) return 3;                // redirect
+    if (status === 'Blocked by robots.txt') return 4;
+    if (status === 'Noindex') return 5;
+    if (status === 'Canonicalised') return 6;
+    if (status === 'Not a page') return 7;               // image, PDF
+    return 8;                                            // Indexable
+  }
+
   /* ------------------------------------------------------------------------
      State
      ------------------------------------------------------------------------ */
@@ -438,7 +454,8 @@
         { label: 'Link or button text' }
       ],
       source: () => state.results.hits,
-      row: hitRow
+      row: hitRow,
+      tiebreak: h => h.page
     },
     broken: {
       columns: [
@@ -449,7 +466,8 @@
         { label: 'Link text' }
       ],
       source: () => state.results.broken,
-      row: brokenRow
+      row: brokenRow,
+      tiebreak: b => b.link
     },
     orphans: {
       columns: [
@@ -459,19 +477,21 @@
         { label: 'Source', by: o => (o.in_sitemap ? 1 : 0) }
       ],
       source: () => state.results.orphans,
-      row: orphanRow
+      row: orphanRow,
+      tiebreak: o => o.url
     },
     pages: {
       columns: [
         { label: 'Page URL' },
         { label: 'Status', by: p => (typeof p.status === 'number' ? p.status : 999), first: 'desc' },
-        // 0 = cannot be indexed, so the first click lifts the problems up
-        { label: 'Indexable', by: p => (p.indexable ? 1 : 0) },
+        // grouped by verdict, worst first - see indexRank above
+        { label: 'Indexable', by: indexRank },
         { label: 'Title' },
         { label: 'Links', by: p => p.links, first: 'desc' }
       ],
       source: () => state.results.pages,
-      row: pageRow
+      row: pageRow,
+      tiebreak: p => p.url
     }
   };
 
@@ -481,11 +501,21 @@
 
     const by = spec.columns[order.index].by;
     const sign = order.dir === 'asc' ? 1 : -1;
+    const tiebreak = spec.tiebreak;
 
     return [...rows].sort((a, b) => {
       const va = by(a), vb = by(b);
-      if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * sign;
-      return String(va).localeCompare(String(vb), undefined, { numeric: true }) * sign;
+      let result;
+      if (typeof va === 'number' && typeof vb === 'number') {
+        result = (va - vb) * sign;
+      } else {
+        result = String(va).localeCompare(String(vb), undefined, { numeric: true }) * sign;
+      }
+      // rows inside one group keep a stable, predictable order
+      if (result === 0 && tiebreak) {
+        return String(tiebreak(a)).localeCompare(String(tiebreak(b)));
+      }
+      return result;
     });
   }
 
