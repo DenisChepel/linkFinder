@@ -143,6 +143,27 @@ Both kinds of links are checked:
 Images, css and scripts are *not* checked unless you tick "Check images and scripts" —
 otherwise every missing icon would drown out the actual broken pages.
 
+#### Pages with no internal links (orphan pages)
+
+In this mode the advanced settings offer **"Also find pages with no internal links"**.
+It reports pages that exist and open fine, but that **no page on the site links to** —
+SEO tools call these *no internal linking URLs*. You can only reach such a page by
+knowing its address; search engines give it almost no weight, and more often than not
+it is simply a page everyone forgot about.
+
+Two things to know:
+
+- **It needs `sitemap.xml`.** A page discovered by following links is, by definition,
+  linked from somewhere — so orphans can only surface where the sitemap lists a page the
+  crawl never reached. On a site without a sitemap the report says so instead of lying.
+- **Run it without limits.** With a crawl depth or page limit set, pages you simply never
+  reached would look like orphans. The log warns you when that is the case.
+
+Only ordinary `<a>` links count as internal linking here — `hreflang` and `canonical`
+carry no weight for search engines, so a page reachable only through them still counts
+as an orphan. That is exactly why the same wording shows up while searching: if every
+match for your link sits in a technical tag, the result is marked **no internal links**.
+
 Reasons are written in plain language:
 
 - `Page not found (404) - broken link` — the classic, needs fixing
@@ -184,6 +205,7 @@ The workbook has four sheets: *Summary*, *Where the link was found*, *Broken lin
 | **Include subdomains** | `blog.example.com`, `info.example.com` — needed when a blog or landing pages live on a separate host |
 | **Check external links** | Also checks links pointing at other sites |
 | **Check images and scripts** | Also finds broken images, css and js. Page links in `<head>` (hreflang, canonical) are checked either way |
+| **Also find pages with no internal links** | Only in *Broken links* mode. Lists pages nothing on the site links to. Needs sitemap.xml and an unlimited crawl |
 | **Threads** | Speed. 10 by default; if the site returns 429, drop to 3–5 |
 | **Crawl depth** | `2` = two clicks from the home page, `0` = start pages only |
 | **Pause between requests** | `0.2–0.5` sec if the site starts blocking you |

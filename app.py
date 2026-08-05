@@ -28,7 +28,7 @@ import core
 
 # Shown in the interface header. If it does not change after a code update,
 # the server is still running the old code and needs a restart.
-VERSION = "2.5"
+VERSION = "2.6"
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -69,7 +69,7 @@ class Job:
         self.summary: dict | None = None
         self.error: str | None = None
         self.xlsx: str | None = None
-        self.results: dict = {"hits": [], "broken": [], "pages": []}
+        self.results: dict = {"hits": [], "broken": [], "pages": [], "orphans": []}
         self.stop_event = threading.Event()
         self.auditor: core.SiteAuditor | None = None
 
@@ -110,6 +110,7 @@ def run_audit(opts: core.Options):
                         "page": h.page, "absolute": h.absolute, "href": h.href,
                         "text": h.text, "tag": h.tag, "context": h.context,
                         "where": h.where, "visible": h.visible,
+                        "no_internal": h.no_internal,
                         "status": h.status if isinstance(h.status, (int, str)) else None,
                         "status_text": core.describe_status(h.status) if h.status is not None else "",
                     }
@@ -131,6 +132,7 @@ def run_audit(opts: core.Options):
                     }
                     for p in sorted(auditor.pages.values(), key=lambda x: x.url)[:UI_ROW_LIMIT]
                 ],
+                "orphans": auditor.orphans[:UI_ROW_LIMIT],
             }
     except Exception:
         tb = traceback.format_exc()
@@ -333,6 +335,7 @@ class Handler(BaseHTTPRequestHandler):
                 use_crawl=data.get("use_crawl", True) is not False,
                 check_external=bool(data.get("check_external")),
                 check_assets=bool(data.get("check_assets")),
+                find_orphans=bool(data.get("find_orphans")),
                 search_raw_html=data.get("search_raw_html", True) is not False,
                 exclude=[x.strip() for x in (data.get("exclude") or "").split(",") if x.strip()],
             )

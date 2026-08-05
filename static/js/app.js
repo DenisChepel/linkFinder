@@ -41,9 +41,12 @@
     document.querySelector('input[name=mode]:checked').value;
 
   function applyMode() {
-    const needsQuery = currentMode() === 'search';
+    const mode = currentMode();
+    const needsQuery = mode === 'search';
     $('queryField').hidden = !needsQuery;
     $('matchRow').hidden = !needsQuery;
+    // the orphan report only makes sense while auditing broken links
+    $('orphanCheck').hidden = mode !== 'broken';
   }
 
   document.querySelectorAll('.mode').forEach((card) => {
@@ -73,7 +76,8 @@
       use_crawl:          $('use_crawl').checked,
       check_external:     $('check_external').checked,
       check_assets:       $('check_assets').checked,
-      search_raw_html:    $('search_raw_html').checked
+      search_raw_html:    $('search_raw_html').checked,
+      find_orphans:       $('find_orphans').checked
     };
   }
 
@@ -176,7 +180,8 @@
      ------------------------------------------------------------------------ */
   function renderResults(status) {
     const summary = status.summary || {};
-    state.results = status.results || { hits: [], broken: [], pages: [] };
+    state.results = status.results || { hits: [], broken: [], pages: [], orphans: [] };
+    state.results.orphans = state.results.orphans || [];
 
     $('resultsCard').hidden = false;
     $('errorBox').innerHTML = status.error
@@ -220,6 +225,14 @@
       ));
     }
 
+    if (summary.orphans_checked) {
+      tiles.push(statTile(
+        summary.orphans ?? 0,
+        'pages nothing links to',
+        summary.orphans ? 'stat--warn' : 'stat--good'
+      ));
+    }
+
     tiles.push(statTile(Math.round(summary.elapsed ?? 0) + 's', 'run time'));
     $('stats').innerHTML = tiles.join('');
   }
@@ -232,6 +245,9 @@
     }
     if (summary.mode === 'broken' || summary.mode === 'full') {
       tabs.push(['broken', '💔 Broken links', state.results.broken.length]);
+    }
+    if (summary.orphans_checked) {
+      tabs.push(['orphans', '🔗 No internal links', state.results.orphans.length]);
     }
     tabs.push(['pages', '🗺️ All pages', state.results.pages.length]);
 
@@ -266,6 +282,14 @@
          ${dead ? `<span class="cell-note--bad"> ${escapeHtml(hit.status_text)}</span>` : ''}
        </div>`;
 
+    // every match sits in a technical tag => nothing on the site actually links here
+    const noInternal = hit.no_internal
+      ? `<div class="cell-note">
+           <span class="pill pill--warn">no internal links</span>
+           <span class="cell-note"> nothing on the site links here — only technical tags</span>
+         </div>`
+      : '';
+
     const rawHref = hit.href !== hit.absolute
       ? `<div class="cell-note">href: <code>${escapeHtml(hit.href)}</code></div>`
       : '';
@@ -276,7 +300,7 @@
 
     return `<tr>
       <td>${linkTo(hit.page)}</td>
-      <td>${linkTo(hit.absolute)}${statusPill}${rawHref}</td>
+      <td>${linkTo(hit.absolute)}${statusPill}${noInternal}${rawHref}</td>
       <td>
         <span class="pill ${hit.visible ? 'pill--good' : 'pill--warn'}">
           ${hit.visible ? '👁 On the page' : '🔧 Technical'}
@@ -334,6 +358,17 @@
     </tr>`;
   }
 
+  function orphanRow(page) {
+    return `<tr>
+      <td>${linkTo(page.url)}</td>
+      <td>${escapeHtml(page.title) || '<span class="cell-note">—</span>'}</td>
+      <td>${page.links_out}</td>
+      <td>${page.in_sitemap
+        ? '<span class="pill pill--info">in sitemap</span>'
+        : '<span class="pill pill--warn">not in sitemap</span>'}</td>
+    </tr>`;
+  }
+
   const TABLE_SPECS = {
     hits: {
       head: ['Page holding the link', 'Found link', 'Where exactly', 'Link or button text'],
@@ -344,6 +379,11 @@
       head: ['Page holding the link', 'Broken link', 'Reason', 'Where exactly', 'Link text'],
       source: () => state.results.broken,
       row: brokenRow
+    },
+    orphans: {
+      head: ['Page nothing links to', 'Title', 'Links out', 'Source'],
+      source: () => state.results.orphans,
+      row: orphanRow
     },
     pages: {
       head: ['Page URL', 'Status', 'Title', 'Links'],

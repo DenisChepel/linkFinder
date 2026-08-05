@@ -28,6 +28,9 @@ Pick one of three modes at the top:
 
   Broken links   Enter the domain only. The result lists every dead link, the
                  reason it is dead, and the page it sits on.
+                 Advanced settings here offer "Also find pages with no internal
+                 links" - pages that open fine but that nothing on the site
+                 links to. Needs the site to have a sitemap.xml.
 
   Site map       Enter the domain only. Returns the list of all pages found.
 

@@ -338,6 +338,7 @@ class LinkHit:
     context: str = ""  # surrounding snippet (for source matches)
     rel: str = ""      # rel attribute of <link> - it defines the meaning
     status: object = None  # status of the found link itself (filled during search)
+    no_internal: bool = False  # nothing but technical tags points at this address
 
     @property
     def where(self) -> str:
@@ -374,6 +375,7 @@ class Options:
     use_crawl: bool = True
     check_external: bool = False          # check external links for breakage
     check_assets: bool = False            # check images/scripts/css
+    find_orphans: bool = False            # also list pages nothing links to
     search_raw_html: bool = True          # also search raw HTML (JS, JSON)
     exclude: list[str] = field(default_factory=list)  # URL patterns to skip
 
@@ -407,9 +409,11 @@ class SiteAuditor:
         self.all_links: list[LinkHit] = []
         self.search_hits: list[LinkHit] = []
         self.broken: list[dict] = []
+        self.orphans: list[dict] = []
         self.redirects: list[dict] = []
         self.status_cache: dict[str, object] = {}
         self.sitemap_count = 0
+        self.sitemap_keys: set[str] = set()
         self.started_at = None
         self.finished_at = None
 
@@ -617,6 +621,7 @@ class SiteAuditor:
             self.log(f"Sitemap gave {len(in_scope)} pages on this domain "
                      f"({len(sm)} entries in total)")
             self.sitemap_count = len(in_scope)
+            self.sitemap_keys = {url_key(u) for u in in_scope}
             seeds.extend(in_scope)
         if not self.opts.use_crawl and len(seeds) == 1:
             self.log("Sitemap is empty and link crawling is off - enabling the crawl anyway.")
@@ -812,10 +817,23 @@ class SiteAuditor:
         if not self.search_hits:
             return
 
-        visible = sum(1 for h in self.search_hits if h.visible)
-        if visible == 0:
-            self.log("  NOTE: no matches among visible links - everything was found in "
-                     "technical tags (<head>, scripts). You will not spot it on the page.")
+        # Per address: is it referenced by any normal link at all? If every
+        # match sits in a technical tag, nothing on the site actually links
+        # there - the SEO tools call this "no internal linking URLs".
+        visible_per_target: dict[str, int] = {}
+        for h in self.search_hits:
+            key = url_key(h.absolute)
+            visible_per_target[key] = visible_per_target.get(key, 0) + (1 if h.visible else 0)
+        for h in self.search_hits:
+            h.no_internal = visible_per_target.get(url_key(h.absolute), 0) == 0
+
+        orphaned = {url_key(h.absolute) for h in self.search_hits if h.no_internal}
+        if orphaned:
+            self.log(f"  NOTE: {len(orphaned)} of the matched "
+                     f"{pl(len(orphaned), 'address', 'addresses')} "
+                     f"{pl(len(orphaned), 'has', 'have')} no internal links - only "
+                     f"technical tags (<head>, scripts) point there, so nothing on "
+                     f"the site actually links to it")
 
         # Check whether the found link itself is alive: people often search for
         # an address that no longer exists.
@@ -928,6 +946,84 @@ class SiteAuditor:
                      f"(<head> hreflang/canonical, scripts) - {uniq} unique "
                      f"{pl(uniq, 'address', 'addresses')} you cannot spot on the page")
 
+    # -- phase 4: pages nothing links to -------------------------------------
+
+    def count_inbound_links(self) -> dict[str, set[str]]:
+        """
+        For every address: which pages link to it with a normal link.
+
+        Only <a>/<area>/<form> counts. hreflang and canonical are deliberately
+        excluded - search engines do not treat them as internal linking, and a
+        page reachable only through them is exactly what we want to surface.
+        """
+        inbound: dict[str, set[str]] = {}
+        for lk in self.all_links:
+            if lk.tag not in NAVIGATION_TAGS:
+                continue
+            if not self.in_scope(lk.absolute):
+                continue
+            src, dst = url_key(lk.page), url_key(lk.absolute)
+            if src == dst:          # a page linking to itself proves nothing
+                continue
+            inbound.setdefault(dst, set()).add(lk.page)
+        return inbound
+
+    def run_orphan_check(self) -> None:
+        """Finds pages that exist but that no page on the site links to."""
+        if not self.opts.use_sitemap:
+            self.log("Orphan check needs sitemap.xml: a page found by crawling is, "
+                     "by definition, linked from somewhere. Skipping.")
+            return
+        if not self.sitemap_count:
+            self.log("Orphan check skipped: this site has no sitemap, so every page "
+                     "here was found by following links - none of them can be an "
+                     "orphan. Nothing to report.")
+            return
+        if self.opts.limit or self.opts.max_depth is not None:
+            self.log("NOTE: crawl was limited, so this list may include pages we "
+                     "simply never reached. Run without limits for a reliable answer.")
+
+        inbound = self.count_inbound_links()
+        root_key = url_key(self.root)
+
+        skipped_assets = 0
+        for page in self.pages.values():
+            if page.status != 200:          # broken pages belong to the other report
+                continue
+            # Sitemaps sometimes list images and PDFs (HubSpot exports /hubfs/*.jpg
+            # that way). Those are files, not pages - nobody expects a link to them.
+            if "html" not in (page.content_type or "").lower() or not is_page_like(page.url):
+                skipped_assets += 1
+                continue
+            key = url_key(page.url)
+            if key == root_key:             # the home page is the entry point
+                continue
+            sources = inbound.get(key, set())
+            if sources:
+                continue
+            self.orphans.append({
+                "url": page.url,
+                "title": page.title,
+                "links_out": page.links_count,
+                "in_sitemap": key in self.sitemap_keys,
+            })
+
+        self.orphans.sort(key=lambda r: r["url"])
+        if skipped_assets:
+            self.log(f"  ignored {skipped_assets} non-HTML entries from the sitemap "
+                     f"(images, PDFs and the like)")
+        self.log(f"Pages with no internal links: {len(self.orphans)}")
+        if self.orphans:
+            self.log("  nothing on the site links to these - they are reachable "
+                     "only by knowing the address:")
+            for o in self.orphans[:5]:
+                self.log(f"    {o['url']}")
+            if len(self.orphans) > 5:
+                self.log(f"    ... and {len(self.orphans) - 5} more")
+            self.log("  NOTE: if the site builds its menus or listings with JavaScript, "
+                     "those links are invisible to any crawler - spot-check a few "
+                     "addresses before treating the whole list as a problem")
+
     # -- run -----------------------------------------------------------------
 
     def run(self) -> dict:
@@ -942,6 +1038,8 @@ class SiteAuditor:
 
         if not self.stopped() and mode in ("broken", "full"):
             self.run_broken_check()
+            if self.opts.find_orphans:
+                self.run_orphan_check()
 
         self.finished_at = datetime.now()
         elapsed = (self.finished_at - self.started_at).total_seconds()
@@ -959,6 +1057,8 @@ class SiteAuditor:
             "hit_pages": len({h.page for h in self.search_hits}),
             "broken": len(self.broken),
             "broken_unique": len({b["link"] for b in self.broken}),
+            "orphans": len(self.orphans),
+            "orphans_checked": self.opts.find_orphans,
             "elapsed": (
                 (self.finished_at - self.started_at).total_seconds()
                 if self.started_at and self.finished_at else 0
@@ -1012,6 +1112,7 @@ def export_xlsx(auditor: SiteAuditor, path: str) -> str:
             ("Pages with matches", s["hit_pages"]),
             ("Broken links (occurrences)", s["broken"]),
             ("Broken links (unique)", s["broken_unique"]),
+            ("Pages with no internal links", s["orphans"] if s["orphans_checked"] else "not checked"),
             ("Duration, seconds", round(s["elapsed"])),
             ("Date", datetime.now().strftime("%Y-%m-%d %H:%M")),
         ],
@@ -1047,6 +1148,17 @@ def export_xlsx(auditor: SiteAuditor, path: str) -> str:
                 for b in auditor.broken
             ],
             [52, 52, 8, 42, 46, 22, 28, 10, 14],
+        )
+
+    if auditor.orphans:
+        make_sheet(
+            "No internal links",
+            ["Page URL", "Title", "Links out of this page", "Listed in sitemap"],
+            [
+                (o["url"], o["title"], o["links_out"], "yes" if o["in_sitemap"] else "no")
+                for o in auditor.orphans
+            ],
+            [70, 55, 22, 18],
         )
 
     make_sheet(
