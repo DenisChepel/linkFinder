@@ -360,6 +360,13 @@ class LinkHit:
     # search engines, and crawlers like Sitebulb leave them out of the count.
     source_canonical: bool = True
 
+    # Indexability of the two pages involved, when we crawled them. Empty for
+    # addresses outside the domain - we never fetched those, so we do not guess.
+    target_index_status: str = ""   # can the address the link points at be indexed?
+    target_index_reason: str = ""
+    source_index_status: str = ""   # can the page holding the link be indexed?
+    source_index_reason: str = ""
+
     @property
     def where(self) -> str:
         return describe_source(self.tag, self.rel)[0]
@@ -833,9 +840,15 @@ class SiteAuditor:
         for h in self.search_hits:
             target = urlparse(h.absolute)
             in_address = needle in (target.netloc + target.path).lower()
-            in_query = bool(target.query) and needle in target.query.lower()
+            query = (target.query or "").lower()
+            # A share button carries a whole URL inside its query string. A
+            # match in the query only means "not a link here" when the query
+            # actually holds another address - otherwise the query is just this
+            # link's own parameter, e.g. ?hs_preview=..., and the link is real.
+            carries_url = bool(re.search(r"https?(://|%3a%2f%2f)", query))
+            in_query = bool(query) and needle in query
 
-            if in_query and not in_address:
+            if in_query and not in_address and carries_url:
                 h.kind = "mention"
             elif url_key(h.page) == url_key(h.absolute):
                 h.kind = "self"
@@ -845,6 +858,20 @@ class SiteAuditor:
             src = self.pages.get(h.page)
             if src and src.canonical:
                 h.source_canonical = url_key(src.canonical) == url_key(h.page)
+
+        # Attach the indexability verdicts we already worked out. "Works" and
+        # "will show up in search" are different things: a link can lead to a
+        # perfectly healthy page that no engine will ever index.
+        by_key = {url_key(url): page for url, page in self.pages.items()}
+        for h in self.search_hits:
+            source = by_key.get(url_key(h.page))
+            if source:
+                h.source_index_status = source.index_status
+                h.source_index_reason = source.index_reason
+            target = by_key.get(url_key(h.absolute))
+            if target:
+                h.target_index_status = target.index_status
+                h.target_index_reason = target.index_reason
 
     def run_search(self) -> None:
         q = self.opts.query
@@ -1368,17 +1395,21 @@ def export_xlsx(auditor: SiteAuditor, path: str) -> str:
         make_sheet(
             "Where the link was found",
             ["Page holding the link", "Full link", "Match type", "Source page",
+             "Source indexable", "Target indexable", "Why target is skipped",
              "Where exactly", "On the page / technical", "Link status",
              "Link or button text", "href as written", "Source context"],
             [
                 (h.page, h.absolute, MATCH_KINDS[h.kind],
                  "canonical" if h.source_canonical else "non-canonical (discounted)",
+                 h.source_index_status or "not crawled",
+                 h.target_index_status or "not crawled",
+                 h.target_index_reason,
                  h.where, "on the page" if h.visible else "technical",
                  describe_status(h.status) if h.status is not None else "not checked",
                  h.text, h.href, h.context)
                 for h in auditor.search_hits
             ],
-            [52, 52, 34, 26, 44, 22, 38, 26, 42, 55],
+            [50, 50, 32, 26, 20, 20, 54, 42, 22, 36, 24, 40, 50],
         )
 
     if auditor.broken:

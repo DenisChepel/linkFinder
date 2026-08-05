@@ -312,6 +312,18 @@
   /* ------------------------------------------------------------------------
      Rendering: table rows
      ------------------------------------------------------------------------ */
+  /* A verdict is only worth showing when it means trouble. "Indexable" and
+     "Not a page" are the normal cases; printing them on every row would bury
+     the rows that actually need a look. Empty means we never crawled that
+     address (an external link), so there is nothing honest to say. */
+  function indexNote(status, reason) {
+    if (!status || status === 'Indexable' || status === 'Not a page') return '';
+    const detail = reason ? `<span class="cell-note"> ${escapeHtml(reason)}</span>` : '';
+    return `<div class="cell-note">
+              <span class="pill pill--warn">${escapeHtml(status)}</span>${detail}
+            </div>`;
+  }
+
   function hitRow(hit) {
     const dead = isDead(hit.status);
 
@@ -356,11 +368,16 @@
        </div>`;
 
     return `<tr>
-      <td>${linkTo(hit.page)}${sourceNote}</td>
+      <td>
+        ${linkTo(hit.page)}${sourceNote}
+        ${indexNote(hit.source_index_status, hit.source_index_reason)}
+      </td>
       <td>
         ${linkTo(hit.absolute)}
         <div class="cell-note">${kindPill}</div>
-        ${kindNote}${statusPill}${noInternal}${rawHref}
+        ${kindNote}${statusPill}
+        ${indexNote(hit.target_index_status, hit.target_index_reason)}
+        ${noInternal}${rawHref}
       </td>
       <td>
         <span class="pill ${hit.visible ? 'pill--good' : 'pill--warn'}">

@@ -28,7 +28,7 @@ import core
 
 # Shown in the interface header. If it does not change after a code update,
 # the server is still running the old code and needs a restart.
-VERSION = "3.2"
+VERSION = "3.3"
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -113,6 +113,10 @@ def run_audit(opts: core.Options):
                         "no_internal": h.no_internal,
                         "kind": h.kind, "kind_text": core.MATCH_KINDS[h.kind],
                         "source_canonical": h.source_canonical,
+                        "target_index_status": h.target_index_status,
+                        "target_index_reason": h.target_index_reason,
+                        "source_index_status": h.source_index_status,
+                        "source_index_reason": h.source_index_reason,
                         "status": h.status if isinstance(h.status, (int, str)) else None,
                         "status_text": core.describe_status(h.status) if h.status is not None else "",
                     }
