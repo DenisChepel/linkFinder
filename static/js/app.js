@@ -77,7 +77,8 @@
       check_external:     $('check_external').checked,
       check_assets:       $('check_assets').checked,
       search_raw_html:    $('search_raw_html').checked,
-      find_orphans:       $('find_orphans').checked
+      find_orphans:       $('find_orphans').checked,
+      only_non_indexable: $('only_non_indexable').checked
     };
   }
 
@@ -245,6 +246,12 @@
       ));
     }
 
+    tiles.push(statTile(
+      summary.non_indexable ?? 0,
+      'pages engines will skip',
+      summary.non_indexable ? 'stat--warn' : 'stat--good'
+    ));
+
     tiles.push(statTile(Math.round(summary.elapsed ?? 0) + 's', 'run time'));
     $('stats').innerHTML = tiles.join('');
   }
@@ -261,7 +268,11 @@
     if (summary.orphans_checked) {
       tabs.push(['orphans', '🔗 No internal links', state.results.orphans.length]);
     }
-    tabs.push(['pages', '🗺️ All pages', state.results.pages.length]);
+    tabs.push([
+      'pages',
+      summary.only_non_indexable ? '🗺️ Non-indexable pages' : '🗺️ All pages',
+      state.results.pages.length
+    ]);
 
     $('tabs').innerHTML = tabs.map(([key, title, count], i) =>
       `<div class="tab ${i === 0 ? 'is-active' : ''}" data-tab="${key}">
@@ -382,9 +393,19 @@
       ? `<div class="cell-note cell-note--bad">${escapeHtml(page.error)}</div>`
       : '';
 
+    const reason = page.index_reason
+      ? `<div class="cell-note">${escapeHtml(page.index_reason)}</div>`
+      : '';
+
     return `<tr>
       <td>${linkTo(page.url)}</td>
       <td><span class="pill ${pillClass}">${escapeHtml(page.status)}</span>${error}</td>
+      <td>
+        <span class="pill ${page.index_status === 'Not a page' ? 'pill--info'
+                            : page.indexable ? 'pill--good' : 'pill--warn'}">
+          ${escapeHtml(page.index_status)}
+        </span>${reason}
+      </td>
       <td>${escapeHtml(page.title)}</td>
       <td>${page.links}</td>
     </tr>`;
@@ -418,7 +439,7 @@
       row: orphanRow
     },
     pages: {
-      head: ['Page URL', 'Status', 'Title', 'Links'],
+      head: ['Page URL', 'Status', 'Indexable', 'Title', 'Links'],
       source: () => state.results.pages,
       row: pageRow
     }

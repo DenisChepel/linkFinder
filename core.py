@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Iterable
 from urllib.parse import urljoin, urlparse, urldefrag, urlunparse, parse_qsl, urlencode
+import urllib.robotparser
 import xml.etree.ElementTree as ET
 
 import requests
@@ -377,7 +378,12 @@ class PageInfo:
     content_type: str = ""
     links_count: int = 0
     error: str = ""
-    canonical: str = ""   # rel=canonical, if the page declares one
+    canonical: str = ""      # rel=canonical, if the page declares one
+    meta_robots: str = ""    # <meta name="robots" content="...">
+    x_robots: str = ""       # X-Robots-Tag response header
+    indexable: bool = True   # may a search engine index this page?
+    index_status: str = "Indexable"   # short verdict for the table
+    index_reason: str = ""            # what exactly decided it
 
 
 @dataclass
@@ -396,6 +402,7 @@ class Options:
     check_external: bool = False          # check external links for breakage
     check_assets: bool = False            # check images/scripts/css
     find_orphans: bool = False            # also list pages nothing links to
+    only_non_indexable: bool = False      # show just the pages engines will skip
     search_raw_html: bool = True          # also search raw HTML (JS, JSON)
     exclude: list[str] = field(default_factory=list)  # URL patterns to skip
 
@@ -436,6 +443,7 @@ class SiteAuditor:
         self.sitemap_keys: set[str] = set()
         self.inbound_pages = 0            # pages that really link to the query
         self.inbound_pages_canonical = 0  # ... of which are canonical
+        self._robots: urllib.robotparser.RobotFileParser | None = None
         self.started_at = None
         self.finished_at = None
 
@@ -562,6 +570,7 @@ class SiteAuditor:
             info.final_url = r.url
             ctype = r.headers.get("Content-Type", "")
             info.content_type = ctype.split(";")[0].strip()
+            info.x_robots = r.headers.get("X-Robots-Tag", "")
 
             if "html" not in ctype.lower():
                 r.close()
@@ -582,15 +591,22 @@ class SiteAuditor:
             info.error = describe_exception(e)
             return info, ""
 
-    def extract_links(self, page_url: str, html_text: str) -> tuple[list[LinkHit], str]:
-        """Pulls every link off a page. Returns (links, title)."""
+    def extract_links(self, page_url: str, html_text: str) -> tuple[list[LinkHit], str, str]:
+        """Pulls every link off a page. Returns (links, title, meta robots)."""
         hits: list[LinkHit] = []
         try:
             soup = BeautifulSoup(html_text, "html.parser")
         except Exception:
-            return hits, ""
+            return hits, "", ""
 
         title = soup.title.get_text(strip=True)[:200] if soup.title else ""
+
+        # <meta name="robots"> and the Google-specific variant decide indexing
+        meta_robots = " ".join(
+            (m.get("content") or "").strip()
+            for m in soup.find_all("meta")
+            if (m.get("name") or "").lower() in ("robots", "googlebot")
+        ).strip()
 
         for tag_name, attr in LINK_SOURCES.items():
             for el in soup.find_all(tag_name):
@@ -629,7 +645,7 @@ class SiteAuditor:
                     page=page_url, href=raw, absolute=absolute,
                     text=text, tag=tag_name, rel=rel,
                 ))
-        return hits, title
+        return hits, title, meta_robots
 
     # -- phase 1: crawl ------------------------------------------------------
 
@@ -669,8 +685,11 @@ class SiteAuditor:
             if self.opts.delay:
                 time.sleep(self.opts.delay)
             info, text = self.fetch(url)
-            links, title = self.extract_links(url, text) if text else ([], "")
+            links, title, meta_robots = (
+                self.extract_links(url, text) if text else ([], "", "")
+            )
             info.title = title
+            info.meta_robots = meta_robots
             info.links_count = len(links)
             info.canonical = next(
                 (l.absolute for l in links
@@ -1035,6 +1054,98 @@ class SiteAuditor:
                      f"(<head> hreflang/canonical, scripts) - {uniq} unique "
                      f"{pl(uniq, 'address', 'addresses')} you cannot spot on the page")
 
+    # -- indexability --------------------------------------------------------
+
+    def load_robots(self) -> None:
+        """Reads robots.txt once so we can tell which URLs are disallowed."""
+        if self._robots is not None:
+            return
+        parser = urllib.robotparser.RobotFileParser()
+        try:
+            r = self.session.get(urljoin(self.root + "/", "robots.txt"), timeout=TIMEOUT)
+            parser.parse(r.text.splitlines() if r.status_code == 200 else [])
+        except Exception:
+            parser.parse([])          # unreachable robots.txt blocks nothing
+        self._robots = parser
+
+    def judge_indexability(self, page: PageInfo) -> None:
+        """
+        Decides whether a search engine may index the page, and says why not.
+
+        Checked in the order an engine applies them: a page blocked in
+        robots.txt is never fetched, so its meta tags are irrelevant, and a
+        canonical pointing elsewhere means the page itself stays out of the
+        index even though it answers fine.
+        """
+        if page.error or not isinstance(page.status, int):
+            page.indexable, page.index_status = False, "Error"
+            page.index_reason = page.error or "the page could not be fetched"
+            return
+
+        if page.status != 200:
+            page.indexable, page.index_status = False, f"HTTP {page.status}"
+            page.index_reason = describe_status(page.status)
+            return
+
+        if "html" not in (page.content_type or "").lower():
+            page.indexable, page.index_status = True, "Not a page"
+            page.index_reason = f"served as {page.content_type or 'unknown type'}"
+            return
+
+        try:
+            allowed = self._robots.can_fetch("*", page.url) if self._robots else True
+        except Exception:
+            allowed = True
+        if not allowed:
+            page.indexable, page.index_status = False, "Blocked by robots.txt"
+            page.index_reason = "robots.txt disallows this path"
+            return
+
+        directives = f"{page.x_robots} {page.meta_robots}".lower()
+        if "noindex" in directives or re.search(r"\bnone\b", directives):
+            source = "X-Robots-Tag header" if "noindex" in (page.x_robots or "").lower() \
+                else "meta robots tag"
+            page.indexable, page.index_status = False, "Noindex"
+            page.index_reason = f"{source} says: {(page.x_robots or page.meta_robots).strip()}"
+            return
+
+        if page.canonical and url_key(page.canonical) != url_key(page.url):
+            page.indexable, page.index_status = False, "Canonicalised"
+            page.index_reason = f"canonical points to {page.canonical}"
+            return
+
+        page.indexable, page.index_status, page.index_reason = True, "Indexable", ""
+
+    def run_indexability_check(self) -> None:
+        """Classifies every crawled page. Costs nothing extra - no requests."""
+        self.load_robots()
+        for page in self.pages.values():
+            self.judge_indexability(page)
+
+        blocked = [p for p in self.pages.values() if not p.indexable]
+        self.log(f"Indexability: {len(self.pages) - len(blocked)} of {len(self.pages)} "
+                 f"pages can be indexed, {len(blocked)} cannot")
+
+        by_reason: dict[str, int] = {}
+        for p in blocked:
+            by_reason[p.index_status] = by_reason.get(p.index_status, 0) + 1
+        for status, count in sorted(by_reason.items(), key=lambda kv: -kv[1]):
+            self.log(f"    {count} x {status}")
+
+        # a page that is both listed in the sitemap and non-indexable is a
+        # contradiction worth pointing at: the site tells Google to index it
+        # and not to index it at the same time
+        contradictory = [
+            p for p in blocked
+            if url_key(p.url) in self.sitemap_keys and p.index_status in ("Noindex", "Canonicalised")
+        ]
+        if contradictory:
+            self.log(f"  NOTE: {len(contradictory)} of them are listed in sitemap.xml "
+                     f"while telling search engines to skip them - the sitemap and the "
+                     f"page contradict each other")
+            for p in contradictory[:5]:
+                self.log(f"    {p.url} - {p.index_status}")
+
     # -- phase 4: pages nothing links to -------------------------------------
 
     def count_inbound_links(self) -> dict[str, set[str]]:
@@ -1122,6 +1233,10 @@ class SiteAuditor:
 
         self.crawl()
 
+        # costs no requests - every signal came with the pages we already fetched
+        if not self.stopped():
+            self.run_indexability_check()
+
         if not self.stopped() and mode in ("search", "full") and self.opts.query:
             self.run_search()
 
@@ -1151,6 +1266,8 @@ class SiteAuditor:
             "broken_unique": len({b["link"] for b in self.broken}),
             "orphans": len(self.orphans),
             "orphans_checked": self.opts.find_orphans,
+            "non_indexable": sum(1 for p in self.pages.values() if not p.indexable),
+            "only_non_indexable": self.opts.only_non_indexable,
             "elapsed": (
                 (self.finished_at - self.started_at).total_seconds()
                 if self.started_at and self.finished_at else 0
@@ -1208,6 +1325,7 @@ def export_xlsx(auditor: SiteAuditor, path: str) -> str:
             ("Broken links (occurrences)", s["broken"]),
             ("Broken links (unique)", s["broken_unique"]),
             ("Pages with no internal links", s["orphans"] if s["orphans_checked"] else "not checked"),
+            ("Pages search engines will skip", s["non_indexable"]),
             ("Duration, seconds", round(s["elapsed"])),
             ("Date", datetime.now().strftime("%Y-%m-%d %H:%M")),
         ],
@@ -1260,12 +1378,14 @@ def export_xlsx(auditor: SiteAuditor, path: str) -> str:
 
     make_sheet(
         "All pages",
-        ["Page URL", "Status", "Title", "Links on page", "Content type", "Error"],
+        ["Page URL", "Status", "Indexable", "Why not", "Title",
+         "Links on page", "Content type", "Error"],
         [
-            (p.url, p.status, p.title, p.links_count, p.content_type, p.error)
+            (p.url, p.status, p.index_status, p.index_reason, p.title,
+             p.links_count, p.content_type, p.error)
             for p in sorted(auditor.pages.values(), key=lambda x: x.url)
         ],
-        [70, 10, 50, 18, 22, 40],
+        [62, 10, 22, 52, 46, 16, 20, 34],
     )
 
     wb.save(path)

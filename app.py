@@ -28,7 +28,7 @@ import core
 
 # Shown in the interface header. If it does not change after a code update,
 # the server is still running the old code and needs a restart.
-VERSION = "2.8"
+VERSION = "2.9"
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -131,8 +131,14 @@ def run_audit(opts: core.Options):
                     {
                         "url": p.url, "status": p.status, "title": p.title,
                         "links": p.links_count, "error": p.error,
+                        "index_status": p.index_status, "index_reason": p.index_reason,
+                        "indexable": p.indexable,
                     }
-                    for p in sorted(auditor.pages.values(), key=lambda x: x.url)[:UI_ROW_LIMIT]
+                    for p in sorted(
+                        (pg for pg in auditor.pages.values()
+                         if not opts.only_non_indexable or not pg.indexable),
+                        key=lambda x: x.url,
+                    )[:UI_ROW_LIMIT]
                 ],
                 "orphans": auditor.orphans[:UI_ROW_LIMIT],
             }
@@ -338,6 +344,7 @@ class Handler(BaseHTTPRequestHandler):
                 check_external=bool(data.get("check_external")),
                 check_assets=bool(data.get("check_assets")),
                 find_orphans=bool(data.get("find_orphans")),
+                only_non_indexable=bool(data.get("only_non_indexable")),
                 search_raw_html=data.get("search_raw_html", True) is not False,
                 exclude=[x.strip() for x in (data.get("exclude") or "").split(",") if x.strip()],
             )

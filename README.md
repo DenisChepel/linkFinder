@@ -235,6 +235,7 @@ The workbook has four sheets: *Summary*, *Where the link was found*, *Broken lin
 | **Check external links** | Also checks links pointing at other sites |
 | **Check images and scripts** | Also finds broken images, css and js. Page links in `<head>` (hreflang, canonical) are checked either way |
 | **Also find pages with no internal links** | Only in *Broken links* mode. Lists pages nothing on the site links to. Needs sitemap.xml and an unlimited crawl |
+| **List only non-indexable pages** | Narrows the page table to those search engines will skip, with the reason |
 | **Threads** | Speed. 10 by default; if the site returns 429, drop to 3–5 |
 | **Crawl depth** | `2` = two clicks from the home page, `0` = start pages only |
 | **Pause between requests** | `0.2–0.5` sec if the site starts blocking you |
@@ -242,6 +243,33 @@ The workbook has four sheets: *Summary*, *Where the link was found*, *Broken lin
 
 The **Stop** button interrupts the crawl, but everything gathered so far is kept and
 the Excel file can still be built — nothing is lost.
+
+---
+
+## Indexability
+
+Every crawled page gets a verdict on whether a search engine may index it. It costs
+nothing — all the signals arrive with the pages already being fetched — so the
+**Indexable** column is always there, in every mode.
+
+| Verdict | What it means |
+|---|---|
+| `Indexable` | nothing stops it from appearing in search |
+| `Noindex` | the page itself says "skip me" via `<meta robots>` or the `X-Robots-Tag` header |
+| `Canonicalised` | its `canonical` points at a different URL, so that other page gets indexed instead |
+| `Blocked by robots.txt` | crawlers are not allowed to fetch it at all |
+| `HTTP 404` / `HTTP 5xx` | it does not answer properly |
+| `Not a page` | an image or PDF listed in the sitemap — not something to index as a page |
+
+The checks run in the order an engine applies them: a page blocked in `robots.txt` is
+never fetched, so its meta tags never matter.
+
+Tick **"List only non-indexable pages"** in the advanced settings to narrow the table
+to just those, with the reason spelled out.
+
+The log also points out a specific contradiction: pages listed in `sitemap.xml` that
+simultaneously tell engines to skip them. The sitemap says "index this", the page says
+"do not" — usually a leftover nobody noticed.
 
 ---
 
