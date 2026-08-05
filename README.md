@@ -36,11 +36,12 @@ The libraries (`requests`, `beautifulsoup4`, `openpyxl`) are installed once and 
 
 ## Sharing with a colleague
 
-`dist\SiteLinkFinder.exe` is a single self-contained file — **12 MB, no Python, no
-libraries, no installation**. Send that one file and it just runs.
+Send them the **[Releases page](../../releases)** — the latest `SiteLinkFinder.exe`
+is attached to every release as a direct download. A single self-contained file,
+**12 MB, no Python, no libraries, no installation**.
 
-**What the colleague does:** double-click the .exe → a console window opens → the
-browser opens the same interface. Reports land in a `results` folder created next to
+**What the colleague does:** download the .exe → double-click → a console window opens
+→ the browser opens the interface. Reports land in a `results` folder created next to
 the .exe. To quit, close the console window.
 
 Two things worth warning them about:
@@ -53,9 +54,28 @@ Two things worth warning them about:
 Requirements on their side: Windows 10 or 11, 64-bit, and internet access to reach the
 site being scanned. Nothing else.
 
-**Rebuilding after code changes:** run `build_exe.bat` (needs Python and PyInstaller —
-it installs PyInstaller itself if missing). The result is written to `dist\SiteLinkFinder.exe`;
-the `build\` folder is temporary and can be deleted.
+### Publishing a new version
+
+The .exe is **not stored in git** — GitHub builds it. To ship an update:
+
+```bash
+git add -A && git commit -m "what changed" && git push
+
+git tag v2.6          # bump VERSION in app.py to match
+git push origin v2.6
+```
+
+Pushing the tag starts [the workflow](.github/workflows/release.yml): GitHub spins up a
+clean Windows machine, builds the .exe, **launches it from an empty folder to confirm it
+really serves the interface**, and only then publishes the release with the file attached.
+Progress is visible on the Actions tab; the whole run takes a few minutes.
+
+The release can also be triggered by hand from the Actions tab
+(*Build and release Windows exe → Run workflow*).
+
+**Building locally** is still possible with `build_exe.bat` — handy for testing a change
+before tagging it. The result lands in `dist\SiteLinkFinder.exe` and is ignored by git;
+the `build\` folder is temporary and can be deleted at any time.
 
 ---
 
