@@ -796,11 +796,23 @@ class SiteAuditor:
             self.log("Looking for sitemap.xml and robots.txt ...")
             sm = self.collect_sitemap_urls()
             in_scope = [u for u in sm if self.in_scope(u)]
-            self.log(f"Sitemap gave {len(in_scope)} pages on this domain "
+
+            # Sitemaps routinely list images and PDFs next to pages - HubSpot
+            # fills them with /hubfs/*.jpg. Those are files, not pages: crawling
+            # them wastes a request each and pads the page count with entries
+            # nobody asked about.
+            pages_only = [u for u in in_scope if is_page_like(u)]
+            files = len(in_scope) - len(pages_only)
+
+            self.log(f"Sitemap gave {len(pages_only)} pages on this domain "
                      f"({len(sm)} entries in total)")
-            self.sitemap_count = len(in_scope)
-            self.sitemap_keys = {url_key(u) for u in in_scope}
-            seeds.extend(in_scope)
+            if files:
+                self.log(f"  skipped {files} non-page {pl(files, 'entry', 'entries')} "
+                         f"from the sitemap (images, PDFs and the like)")
+
+            self.sitemap_count = len(pages_only)
+            self.sitemap_keys = {url_key(u) for u in pages_only}
+            seeds.extend(pages_only)
         if not self.opts.use_crawl and len(seeds) == 1:
             self.log("Sitemap is empty and link crawling is off - enabling the crawl anyway.")
             self.opts.use_crawl = True
