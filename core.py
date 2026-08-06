@@ -28,7 +28,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Iterable
 from urllib.parse import urljoin, urlparse, urldefrag, urlunparse, parse_qsl, urlencode
-import urllib.robotparser
 import xml.etree.ElementTree as ET
 
 import requests
@@ -44,6 +43,12 @@ USER_AGENT = (
 )
 TIMEOUT = 20
 MAX_BODY_BYTES = 8 * 1024 * 1024  # never pull huge files into memory
+
+# A timeout or a 429 usually means the site was busy, not that the page is
+# broken. Retrying once keeps a hiccup from being reported as a dead link.
+RETRIES = 1
+RETRY_PAUSE = 1.5
+RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 # Where links come from: tag -> attribute
 LINK_SOURCES = {
@@ -219,6 +224,94 @@ def pl(n: int, word: str, plural_form: str | None = None) -> str:
     return word if abs(n) == 1 else (plural_form or word + "s")
 
 
+class RobotsRules:
+    """
+    robots.txt parser.
+
+    Python's urllib.robotparser is not usable here: a blank line after
+    "User-agent: *" ends the record for it, so a perfectly ordinary file like
+
+        User-agent: *
+
+        # comment
+        Disallow: /private
+
+    parses into zero rules and every URL comes back allowed. Real files are
+    written that way all the time, so the check silently passed everything.
+
+    This follows RFC 9309 instead: blank lines and comments are ignored, a
+    group ends only at the next User-agent line, and Allow/Disallow support
+    the '*' and '$' wildcards. The longest matching rule wins, with Allow
+    beating Disallow on a tie - the behaviour Google documents.
+    """
+
+    def __init__(self, text: str = ""):
+        self.rules: list[tuple[str, bool]] = []   # (pattern, allowed)
+        self.disallow_count = 0
+        self._cache: dict[str, bool] = {}
+        if text:
+            self.parse(text)
+
+    def parse(self, text: str) -> None:
+        applies = False          # are we inside a group that covers everyone?
+        expecting_agents = False  # consecutive User-agent lines share one group
+
+        for raw in text.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line or ":" not in line:
+                continue
+            field, _, value = line.partition(":")
+            field, value = field.strip().lower(), value.strip()
+
+            if field == "user-agent":
+                if not expecting_agents:      # a new group starts here
+                    applies = False
+                    expecting_agents = True
+                if value == "*":
+                    applies = True
+                continue
+
+            expecting_agents = False
+            if not applies or field not in ("allow", "disallow"):
+                continue
+            if field == "disallow" and not value:
+                continue                      # "Disallow:" alone means allow all
+            self.rules.append((value, field == "allow"))
+            if field == "disallow":
+                self.disallow_count += 1
+
+    @staticmethod
+    def _matches(pattern: str, path: str) -> bool:
+        anchored = pattern.endswith("$")
+        if anchored:
+            pattern = pattern[:-1]
+        regex = "".join(".*" if ch == "*" else re.escape(ch) for ch in pattern)
+        return bool(re.match(regex + ("$" if anchored else ""), path))
+
+    def allowed(self, url: str) -> bool:
+        """May a crawler fetch this URL?"""
+        if not self.rules:
+            return True
+        try:
+            p = urlparse(url)
+        except Exception:
+            return True
+        path = (p.path or "/") + (f"?{p.query}" if p.query else "")
+
+        cached = self._cache.get(path)
+        if cached is not None:
+            return cached
+
+        best_len, verdict = -1, True
+        for pattern, is_allow in self.rules:
+            if self._matches(pattern, path) and len(pattern) >= best_len:
+                # equal length: Allow wins, as Google specifies
+                if len(pattern) > best_len or is_allow:
+                    best_len, verdict = len(pattern), is_allow
+        self._cache[path] = verdict
+        return verdict
+
+
 def is_page_like(url: str) -> bool:
     """Does this look like an HTML page (rather than an image or archive)?"""
     path = urlparse(url).path
@@ -375,6 +468,12 @@ class LinkHit:
     def visible(self) -> bool:
         return describe_source(self.tag, self.rel)[1]
 
+    @property
+    def nofollow(self) -> bool:
+        """The site tells engines not to pass any weight through this link."""
+        parts = (self.rel or "").lower().split()
+        return any(k in parts for k in ("nofollow", "sponsored", "ugc"))
+
 
 @dataclass
 class PageInfo:
@@ -391,6 +490,7 @@ class PageInfo:
     indexable: bool = True   # may a search engine index this page?
     index_status: str = "Indexable"   # short verdict for the table
     index_reason: str = ""            # what exactly decided it
+    inbound: int = 0         # how many pages of this site link TO this page
 
 
 @dataclass
@@ -410,6 +510,7 @@ class Options:
     check_assets: bool = False            # check images/scripts/css
     find_orphans: bool = False            # also list pages nothing links to
     only_non_indexable: bool = False      # show just the pages engines will skip
+    respect_robots: bool = False          # skip URLs robots.txt disallows
     search_raw_html: bool = True          # also search raw HTML (JS, JSON)
     exclude: list[str] = field(default_factory=list)  # URL patterns to skip
 
@@ -444,13 +545,13 @@ class SiteAuditor:
         self.search_hits: list[LinkHit] = []
         self.broken: list[dict] = []
         self.orphans: list[dict] = []
-        self.redirects: list[dict] = []
         self.status_cache: dict[str, object] = {}
         self.sitemap_count = 0
         self.sitemap_keys: set[str] = set()
         self.inbound_pages = 0            # pages that really link to the query
         self.inbound_pages_canonical = 0  # ... of which are canonical
-        self._robots: urllib.robotparser.RobotFileParser | None = None
+        self._robots: RobotsRules | None = None
+        self._robots_skipped = 0
         self.started_at = None
         self.finished_at = None
 
@@ -495,7 +596,14 @@ class SiteAuditor:
         return a == b or a == "www." + b or "www." + a == b
 
     def excluded(self, url: str) -> bool:
-        return any(pat and pat.lower() in url.lower() for pat in self.opts.exclude)
+        if any(pat and pat.lower() in url.lower() for pat in self.opts.exclude):
+            return True
+        if self.opts.respect_robots:
+            self.load_robots()
+            if self._robots and not self._robots.allowed(url):
+                self._robots_skipped += 1
+                return True
+        return False
 
     # -- source discovery ----------------------------------------------------
 
@@ -568,11 +676,15 @@ class SiteAuditor:
 
     # -- page download -------------------------------------------------------
 
-    def fetch(self, url: str) -> tuple[PageInfo, str]:
+    def fetch(self, url: str, attempt: int = 0) -> tuple[PageInfo, str]:
         """Downloads a page. Returns (PageInfo, html text)."""
         info = PageInfo(url=url)
         try:
             r = self.session.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True)
+            if r.status_code in RETRY_STATUSES and attempt < RETRIES and not self.stopped():
+                r.close()
+                time.sleep(RETRY_PAUSE)
+                return self.fetch(url, attempt + 1)
             info.status = r.status_code
             info.final_url = r.url
             ctype = r.headers.get("Content-Type", "")
@@ -594,6 +706,11 @@ class SiteAuditor:
             text = b"".join(chunks).decode(encoding, errors="replace")
             return info, text
         except Exception as e:
+            import requests.exceptions as rex
+            transient = isinstance(e, (rex.Timeout, rex.ConnectionError))
+            if transient and attempt < RETRIES and not self.stopped():
+                time.sleep(RETRY_PAUSE)
+                return self.fetch(url, attempt + 1)
             info.status = "ERROR"
             info.error = describe_exception(e)
             return info, ""
@@ -615,6 +732,16 @@ class SiteAuditor:
             if (m.get("name") or "").lower() in ("robots", "googlebot")
         ).strip()
 
+        # <base href> re-points every relative link on the page. Miss it and
+        # each one resolves against the wrong folder. It only affects how links
+        # are resolved - the page keeps its own address.
+        base_url = page_url
+        base_tag = soup.find("base", href=True)
+        if base_tag:
+            candidate = urljoin(page_url, clean_url(base_tag["href"]))
+            if candidate.lower().startswith(("http://", "https://")):
+                base_url = candidate
+
         for tag_name, attr in LINK_SOURCES.items():
             for el in soup.find_all(tag_name):
                 raw = el.get(attr)
@@ -623,17 +750,17 @@ class SiteAuditor:
                 raw = raw.strip()
                 if not raw or raw.lower().startswith(SKIP_SCHEMES):
                     continue
-                # for <link> keep only the meaningful rel values
-                rel = ""
-                if tag_name == "link":
-                    rel = " ".join(el.get("rel") or []).lower()
-                    if not any(k in ALLOWED_LINK_RELS for k in rel.split()):
-                        continue
+                # rel matters on every tag: on <link> it says what the tag is
+                # for, on <a> it can say nofollow/sponsored/ugc - links the site
+                # deliberately refuses to vouch for
+                rel = " ".join(el.get("rel") or []).lower()
+                if tag_name == "link" and not any(k in ALLOWED_LINK_RELS for k in rel.split()):
+                    continue
                 cleaned = clean_url(raw)
                 if not cleaned:
                     continue
                 try:
-                    absolute = urljoin(page_url, cleaned)
+                    absolute = urljoin(base_url, cleaned)
                 except Exception:
                     continue
                 if not absolute.lower().startswith(("http://", "https://")):
@@ -765,6 +892,15 @@ class SiteAuditor:
                 )
                 self.log(f"  pages crawled: {processed}, left in queue: {len(queue)}{added}")
                 discovered = 0
+
+        if self.opts.respect_robots and self._robots_skipped:
+            self.log(f"Skipped {self._robots_skipped} "
+                     f"{pl(self._robots_skipped, 'address', 'addresses')} because "
+                     f"robots.txt disallows them")
+        elif self._robots and self._robots.disallow_count and not self.opts.respect_robots:
+            self.log(f"Note: robots.txt has {self._robots.disallow_count} Disallow "
+                     f"{pl(self._robots.disallow_count, 'rule')}; crawling those "
+                     f"addresses anyway (tick 'Respect robots.txt' to skip them)")
 
         extra = len(queued) - self.sitemap_count
         if self.opts.use_crawl and extra > 0:
@@ -940,9 +1076,15 @@ class SiteAuditor:
         # that genuinely link here, and how many of those actually pass weight.
         direct = [h for h in self.search_hits if h.kind == "direct"]
         self.inbound_pages = len({url_key(h.page) for h in direct})
+        # a nofollow link is a link a visitor can click but that passes no
+        # weight, so it does not count towards the SEO figure
         self.inbound_pages_canonical = len(
-            {url_key(h.page) for h in direct if h.source_canonical}
+            {url_key(h.page) for h in direct if h.source_canonical and not h.nofollow}
         )
+        nofollowed = sum(1 for h in direct if h.nofollow)
+        if nofollowed:
+            self.log(f"  {nofollowed} of them {pl(nofollowed, 'is', 'are')} rel=nofollow - "
+                     f"clickable, but passing no weight")
         mentions = sum(1 for h in self.search_hits if h.kind == "mention")
         selfies = sum(1 for h in self.search_hits if h.kind == "self")
 
@@ -997,15 +1139,23 @@ class SiteAuditor:
 
     # -- phase 3: broken links -----------------------------------------------
 
-    def check_link(self, url: str) -> object:
+    def check_link(self, url: str, attempt: int = 0) -> object:
         try:
             r = self.session.head(url, timeout=TIMEOUT, allow_redirects=True)
             if r.status_code in (400, 403, 405, 501) or r.status_code >= 500:
                 # some servers do not handle HEAD - retry with GET
                 r = self.session.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True)
                 r.close()
+            if r.status_code in RETRY_STATUSES and attempt < RETRIES and not self.stopped():
+                time.sleep(RETRY_PAUSE)
+                return self.check_link(url, attempt + 1)
             return r.status_code
         except Exception as e:
+            import requests.exceptions as rex
+            if isinstance(e, (rex.Timeout, rex.ConnectionError)) \
+                    and attempt < RETRIES and not self.stopped():
+                time.sleep(RETRY_PAUSE)
+                return self.check_link(url, attempt + 1)
             return describe_exception(e)
 
     def run_broken_check(self) -> None:
@@ -1087,13 +1237,14 @@ class SiteAuditor:
         """Reads robots.txt once so we can tell which URLs are disallowed."""
         if self._robots is not None:
             return
-        parser = urllib.robotparser.RobotFileParser()
+        text = ""
         try:
             r = self.session.get(urljoin(self.root + "/", "robots.txt"), timeout=TIMEOUT)
-            parser.parse(r.text.splitlines() if r.status_code == 200 else [])
+            if r.status_code == 200:
+                text = r.text
         except Exception:
-            parser.parse([])          # unreachable robots.txt blocks nothing
-        self._robots = parser
+            pass                      # unreachable robots.txt blocks nothing
+        self._robots = RobotsRules(text)
 
     def judge_indexability(self, page: PageInfo) -> None:
         """
@@ -1120,11 +1271,7 @@ class SiteAuditor:
                                  f"{page.content_type or 'an unknown type'}")
             return
 
-        try:
-            allowed = self._robots.can_fetch("*", page.url) if self._robots else True
-        except Exception:
-            allowed = True
-        if not allowed:
+        if self._robots and not self._robots.allowed(page.url):
             page.indexable, page.index_status = False, "Blocked by robots.txt"
             page.index_reason = ("robots.txt forbids crawlers from opening this "
                                  "address, so it never reaches the index")
@@ -1179,6 +1326,12 @@ class SiteAuditor:
         self.load_robots()
         for page in self.pages.values():
             self.judge_indexability(page)
+
+        # How many pages link TO each page. Not to be confused with the number
+        # of links ON it - the two answer opposite questions.
+        inbound = self.count_inbound_links()
+        for page in self.pages.values():
+            page.inbound = len(inbound.get(url_key(page.url), ()))
 
         blocked = [p for p in self.pages.values() if not p.indexable]
         self.log(f"Indexability: {len(self.pages) - len(blocked)} of {len(self.pages)} "
@@ -1441,13 +1594,14 @@ def export_xlsx(auditor: SiteAuditor, path: str) -> str:
     make_sheet(
         "All pages",
         ["Page URL", "Status", "Indexable", "Why not", "Title",
-         "Links on page", "Content type", "Error"],
+         "Links pointing here (inbound)", "Links placed on this page (outbound)",
+         "Content type", "Error"],
         [
             (p.url, p.status, p.index_status, p.index_reason, p.title,
-             p.links_count, p.content_type, p.error)
+             p.inbound, p.links_count, p.content_type, p.error)
             for p in sorted(auditor.pages.values(), key=lambda x: x.url)
         ],
-        [62, 10, 22, 52, 46, 16, 20, 34],
+        [58, 10, 22, 50, 44, 28, 32, 18, 30],
     )
 
     wb.save(path)

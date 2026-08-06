@@ -95,7 +95,8 @@
       check_assets:       $('check_assets').checked,
       search_raw_html:    $('search_raw_html').checked,
       find_orphans:       $('find_orphans').checked,
-      only_non_indexable: $('only_non_indexable').checked
+      only_non_indexable: $('only_non_indexable').checked,
+      respect_robots:     $('respect_robots').checked
     };
   }
 
@@ -358,6 +359,11 @@
       self:    '<span class="pill pill--info">links to itself</span>'
     }[hit.kind] || '';
 
+    // rel=nofollow: clickable for a visitor, worthless for search engines
+    const nofollowPill = hit.nofollow
+      ? ' <span class="pill pill--warn">nofollow — passes no weight</span>'
+      : '';
+
     const kindNote = hit.kind === 'direct' ? '' :
       `<div class="cell-note">${escapeHtml(hit.kind_text)}</div>`;
 
@@ -374,7 +380,7 @@
       </td>
       <td>
         ${linkTo(hit.absolute)}
-        <div class="cell-note">${kindPill}</div>
+        <div class="cell-note">${kindPill}${nofollowPill}</div>
         ${kindNote}${statusPill}
         ${indexNote(hit.target_index_status, hit.target_index_reason)}
         ${noInternal}${rawHref}
@@ -432,6 +438,11 @@
       ? `<div class="cell-note">${escapeHtml(page.index_reason)}</div>`
       : '';
 
+    // a page nothing links to is worth noticing right in the table
+    const inbound = page.inbound === 0
+      ? `<span class="pill pill--warn">0</span>`
+      : page.inbound;
+
     return `<tr>
       <td>${linkTo(page.url)}</td>
       <td><span class="pill ${pillClass}">${escapeHtml(page.status)}</span>${error}</td>
@@ -442,7 +453,8 @@
         </span>${reason}
       </td>
       <td>${escapeHtml(page.title)}</td>
-      <td>${page.links}</td>
+      <td>${inbound}</td>
+      <td>${page.links_out}</td>
     </tr>`;
   }
 
@@ -504,7 +516,9 @@
         // grouped by verdict, worst first - see indexRank above
         { label: 'Indexable', by: indexRank },
         { label: 'Title' },
-        { label: 'Links', by: p => p.links, first: 'desc' }
+        // two opposite questions, so they get two columns with explicit names
+        { label: 'Links here ↓', by: p => p.inbound },
+        { label: 'Links on page', by: p => p.links_out, first: 'desc' }
       ],
       source: () => state.results.pages,
       row: pageRow,

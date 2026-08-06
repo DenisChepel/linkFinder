@@ -237,6 +237,7 @@ The workbook has four sheets: *Summary*, *Where the link was found*, *Broken lin
 | **Check images and scripts** | Also finds broken images, css and js. Page links in `<head>` (hreflang, canonical) are checked either way |
 | **Also find pages with no internal links** | Only in *Broken links* mode. Lists pages nothing on the site links to. Needs sitemap.xml and an unlimited crawl |
 | **List only non-indexable pages** | Narrows the page table to those search engines will skip, with the reason |
+| **Respect robots.txt** | Skips addresses the site forbids crawlers to open. Off by default — on your own site you usually want to see everything, including what robots.txt hides |
 | **Threads** | Speed. 10 by default; if the site returns 429, drop to 3–5 |
 | **Crawl depth** | `2` = two clicks from the home page, `0` = start pages only |
 | **Pause between requests** | `0.2–0.5` sec if the site starts blocking you |
@@ -271,6 +272,27 @@ to just those, with the reason spelled out.
 The log also points out a specific contradiction: pages listed in `sitemap.xml` that
 simultaneously tell engines to skip them. The sitemap says "index this", the page says
 "do not" — usually a leftover nobody noticed.
+
+---
+
+## Two link counts that are easy to confuse
+
+The page table has two columns, and they answer opposite questions:
+
+| Column | Meaning |
+|---|---|
+| **Links here ↓** | how many pages of the site link **to** this page (inbound) |
+| **Links on page** | how many links this page itself **contains** (outbound) |
+
+A blog post can hold 248 links — its menu, footer and "read next" block — while only
+11 places on the site link to it. Both numbers are useful, but for "how important is
+this page" the first one is the one to read. A page showing **0** there is linked from
+nowhere.
+
+Links marked `rel="nofollow"` (also `sponsored` and `ugc`) are flagged in the results:
+a visitor can click them, but the site refuses to vouch for them, so search engines
+pass no weight through. They are excluded from the canonical inbound count for the
+same reason.
 
 ---
 

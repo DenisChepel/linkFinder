@@ -28,7 +28,7 @@ import core
 
 # Shown in the interface header. If it does not change after a code update,
 # the server is still running the old code and needs a restart.
-VERSION = "3.3"
+VERSION = "3.4"
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -113,6 +113,7 @@ def run_audit(opts: core.Options):
                         "no_internal": h.no_internal,
                         "kind": h.kind, "kind_text": core.MATCH_KINDS[h.kind],
                         "source_canonical": h.source_canonical,
+                        "nofollow": h.nofollow,
                         "target_index_status": h.target_index_status,
                         "target_index_reason": h.target_index_reason,
                         "source_index_status": h.source_index_status,
@@ -134,7 +135,7 @@ def run_audit(opts: core.Options):
                 "pages": [
                     {
                         "url": p.url, "status": p.status, "title": p.title,
-                        "links": p.links_count, "error": p.error,
+                        "links_out": p.links_count, "inbound": p.inbound, "error": p.error,
                         "index_status": p.index_status, "index_reason": p.index_reason,
                         "indexable": p.indexable,
                     }
@@ -349,6 +350,7 @@ class Handler(BaseHTTPRequestHandler):
                 check_assets=bool(data.get("check_assets")),
                 find_orphans=bool(data.get("find_orphans")),
                 only_non_indexable=bool(data.get("only_non_indexable")),
+                respect_robots=bool(data.get("respect_robots")),
                 search_raw_html=data.get("search_raw_html", True) is not False,
                 exclude=[x.strip() for x in (data.get("exclude") or "").split(",") if x.strip()],
             )
