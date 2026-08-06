@@ -551,7 +551,8 @@ class SiteAuditor:
         self.inbound_pages = 0            # pages that really link to the query
         self.inbound_pages_canonical = 0  # ... of which are canonical
         self._robots: RobotsRules | None = None
-        self._robots_skipped = 0
+        self._robots_text: str | None = None   # fetched once, reused
+        self._robots_skipped: set[str] = set()
         self.started_at = None
         self.finished_at = None
 
@@ -601,7 +602,9 @@ class SiteAuditor:
         if self.opts.respect_robots:
             self.load_robots()
             if self._robots and not self._robots.allowed(url):
-                self._robots_skipped += 1
+                # the same address is checked once per link pointing at it,
+                # so count distinct addresses rather than checks
+                self._robots_skipped.add(url_key(url))
                 return True
         return False
 
@@ -613,6 +616,9 @@ class SiteAuditor:
         robots = urljoin(self.root + "/", "robots.txt")
         try:
             r = self.session.get(robots, timeout=TIMEOUT)
+            # keep the text: the indexability check needs the same file, and
+            # fetching it twice would be wasteful
+            self._robots_text = r.text if r.status_code == 200 else ""
             if r.status_code == 200:
                 for line in r.text.splitlines():
                     if line.lower().startswith("sitemap:"):
@@ -893,9 +899,10 @@ class SiteAuditor:
                 self.log(f"  pages crawled: {processed}, left in queue: {len(queue)}{added}")
                 discovered = 0
 
+        self.load_robots()   # cheap: the file was already fetched for the sitemap
         if self.opts.respect_robots and self._robots_skipped:
-            self.log(f"Skipped {self._robots_skipped} "
-                     f"{pl(self._robots_skipped, 'address', 'addresses')} because "
+            n = len(self._robots_skipped)
+            self.log(f"Skipped {n} {pl(n, 'address', 'addresses')} because "
                      f"robots.txt disallows them")
         elif self._robots and self._robots.disallow_count and not self.opts.respect_robots:
             self.log(f"Note: robots.txt has {self._robots.disallow_count} Disallow "
@@ -1237,13 +1244,14 @@ class SiteAuditor:
         """Reads robots.txt once so we can tell which URLs are disallowed."""
         if self._robots is not None:
             return
-        text = ""
-        try:
-            r = self.session.get(urljoin(self.root + "/", "robots.txt"), timeout=TIMEOUT)
-            if r.status_code == 200:
-                text = r.text
-        except Exception:
-            pass                      # unreachable robots.txt blocks nothing
+        text = self._robots_text
+        if text is None:
+            try:
+                r = self.session.get(urljoin(self.root + "/", "robots.txt"), timeout=TIMEOUT)
+                text = r.text if r.status_code == 200 else ""
+            except Exception:
+                text = ""             # unreachable robots.txt blocks nothing
+            self._robots_text = text
         self._robots = RobotsRules(text)
 
     def judge_indexability(self, page: PageInfo) -> None:
